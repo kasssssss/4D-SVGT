@@ -1,0 +1,14 @@
+# @package _global_
+
+defaults:
+  - /train/vggt/default.yaml
+  - _self_
+
+log_dir: output/vggt/eval/geometry/official_ckpt
+checkpoint_path: ckpt/VGGT-1B/model.safetensors
+
+model_wrapper_conf:
+  _target_: dvgt.evaluation.models.vggt.VGGTWrapper
+  model_config: ${model}
+  eval_config:
+    use_umeyama_per_scene: True

@@ -1,0 +1,26 @@
+--find-links https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu128.html
+
+torch==2.8.0
+torchvision==0.23.0
+numpy==2.2.6
+Pillow
+huggingface_hub
+einops
+safetensors
+iopath
+wcmatch
+tensorboard
+fvcore
+pyarrow
+viser==0.2.23
+tqdm
+hydra-core
+omegaconf
+opencv-python
+scipy
+onnxruntime
+requests
+trimesh
+matplotlib
+pydantic==2.10.6
+kaolin==0.18.0

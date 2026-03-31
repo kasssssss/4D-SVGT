@@ -1,0 +1,27 @@
+# @package _global_
+
+defaults:
+  - /train/dvgt2/default_mlp_head.yaml
+  - _self_
+
+log_dir: output/dvgt2/eval/closed_loop/default_mlp_head
+checkpoint_path: ckpt/dvgt2_mlp_head.pt
+
+data_conf:
+  val:
+    common_dataset_config:
+      clip_split_type: navtest
+    dataset_config:
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/openscene_navtest.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+
+model_wrapper_conf:
+  _target_: dvgt.evaluation.models.dvgt2.DVGT2Wrapper
+  model_config: ${model}
+  eval_config:
+    gt_scale_factor: ${gt_scale_factor}
+    # Window size for streaming evaluation. Set > 0 to enable; -1 for full-sequence offline inference.
+    infer_window: -1    
+    eval_point_and_pose: False
+    eval_traj: True

@@ -1,0 +1,41 @@
+# @package _global_
+
+log_dir: output/base
+# This option controls the number of iterations per train/val epoch
+limit_train_batches: 1000    # 1000 iterations per training epoch
+limit_val_batches: null
+
+logging_conf:
+  log_dir: ${log_dir}
+
+  # visual log
+  log_visuals: True
+  log_visual_frequency:
+    train: 5000    # Visualize every 5 epochs
+    val: 250
+
+  # objective log
+  log_freq: 10
+  log_level_primary: INFO
+  log_level_secondary: ERROR
+  all_ranks: False
+  tensorboard_writer:
+    _target_: dvgt.utils.tb_writer.TensorBoardLogger
+    path: ${log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_absolute_ego_pose_T
+        - loss_absolute_ego_pose_T
+        - loss_ego_first_conf_point
+        - loss_ego_first_reg_point
+        - loss_ego_first_grad_point
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_absolute_ego_pose_T
+        - loss_absolute_ego_pose_T
+        - loss_ego_first_conf_point
+        - loss_ego_first_reg_point
+        - loss_ego_first_grad_point

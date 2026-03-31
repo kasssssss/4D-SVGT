@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  - /train/dvgt1/default.yaml
+  - _self_
+
+log_dir: output/dvgt1/eval/geometry/demo_data
+checkpoint_path: ckpt/dvgt1.pt
+
+data_conf:
+  val:
+    dataset_config:
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/openscene_test_sample_1.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+
+model_wrapper_conf:
+  _target_: dvgt.evaluation.models.dvgt1.DVGT1Wrapper
+  model_config:
+    dino_v3_weight_path: ckpt/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
+  eval_config:
+    gt_scale_factor: ${gt_scale_factor}

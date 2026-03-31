@@ -1,0 +1,31 @@
+# @package _global_
+
+# This version is fine-tuned from NuScenes, now incorporating 
+# ego-vehicle status (e.g., velocity, acc, driving command) as an auxiliary input.
+
+defaults:
+  - /train/dvgt2/default.yaml
+  - _self_
+
+log_dir: output/dvgt2/eval/open_loop/default_finetune_nuscenes
+checkpoint_path: ckpt/dvgt2.pt
+
+data_conf:
+  val:
+    common_dataset_config:
+      future_frame_num: 6
+      clip_split_type: nuscenes_planning
+    dataset_config:
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/nuscene_val.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+
+model_wrapper_conf:
+  _target_: dvgt.evaluation.models.dvgt2.DVGT2Wrapper
+  model_config: ${model}
+  eval_config:
+    gt_scale_factor: ${gt_scale_factor}
+    # Window size for streaming evaluation. Set > 0 to enable; -1 for full-sequence offline inference.
+    infer_window: -1    
+    eval_point_and_pose: False
+    eval_traj: True

@@ -1,0 +1,9 @@
+{    
+    "KITTI": {
+        "path": "/high_perf_store3/data-lm/xiezixun/public_datasets/kitti/val_moge_v2/KITTI",
+        "width": 750,
+        "height": 375,
+        "split": ".index.txt",
+        "depth_unit": 1
+    }
+}

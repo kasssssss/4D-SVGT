@@ -1,0 +1,35 @@
+# @package _global_
+
+defaults:
+  - /train/dvgt2/pretrain.yaml
+  - _self_
+
+log_dir: output/dvgt2/eval/geometry/pretrain_official_ckpt
+checkpoint_path: ckpt/dvgt2_stage_1_pretrain.pt
+
+data_conf:
+  val:
+    dataset_config:
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/kitti_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 3.3
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/openscene_test.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/nuscene_val.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/waymo_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/ddad_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 1.6
+
+model_wrapper_conf:
+  _target_: dvgt.evaluation.models.dvgt2.DVGT2Wrapper
+  model_config: ${model}
+  eval_config:
+    gt_scale_factor: ${gt_scale_factor}
+    infer_window: -1
+    eval_traj: False

@@ -1,0 +1,50 @@
+# @package _global_
+
+defaults:
+  - default.yaml
+  - _self_
+
+max_epochs: 40
+lr: 1e-5
+log_dir: output/dvgt2/train/default_finetune_nuscenes
+
+fixed_num_views: 6
+fixed_aspect_ratio: 1.77
+fixed_num_frames: 4
+enable_ego_status: True
+
+checkpoint:
+  save_dir: ${log_dir}/ckpts
+  save_freq: 2
+  direct_load_pretrained_weights_path: ckpt/dvgt2.pt
+  load_pretrained_weights_path_dvgt: null
+  strict: True
+
+eval_conf:
+  gt_scale_factor: ${gt_scale_factor}
+  eval_point_and_pose: False
+
+data_conf:
+  train:
+    common_dataset_config:
+      fixed_num_views: ${fixed_num_views}
+      fixed_aspect_ratio: ${fixed_aspect_ratio}
+      fixed_num_frames: ${fixed_num_frames}
+      aug_pixel_aspect_range: null    # close data augmentation
+      enable_random_resize: False 
+    dataset_config:
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/nuscene_train.parquet
+        original_fps: 2
+        dataset_len: 1400000
+        frame_num_max: 40
+    sampler_config:
+      fixed_num_views: ${fixed_num_views}
+      fixed_aspect_ratio: ${fixed_aspect_ratio}
+      fixed_num_frames: ${fixed_num_frames}
+  val:
+    common_dataset_config:
+      clip_split_type: nuscenes_planning
+    dataset_config:
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/nuscene_val.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77

@@ -1,0 +1,32 @@
+# @package _global_
+
+defaults:
+  - /train/dvgt1/default.yaml
+  - _self_
+
+log_dir: output/dvgt1/eval/geometry/official_ckpt
+checkpoint_path: ckpt/dvgt1.pt
+
+data_conf:
+  val:
+    dataset_config:
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/kitti_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 3.3
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/openscene_test.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/nuscene_val.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/waymo_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/ddad_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 1.6
+
+model_wrapper_conf:
+  _target_: dvgt.evaluation.models.dvgt1.DVGT1Wrapper
+  model_config: ${model}
+  eval_config: ${eval_conf}

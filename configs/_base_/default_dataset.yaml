@@ -1,0 +1,120 @@
+# @package _global_
+
+# Template for the dataset config
+max_img_per_gpu: 48
+num_workers: 4
+gt_scale_factor: 0.1
+enable_point_in_ego_n: False
+enable_point_in_ego_first: True
+future_frame_num: 0
+enable_past_ego: False
+enable_ego_status: False
+
+data_conf:
+  train:
+    _target_: dvgt.datasets.loader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    training: True
+    common_dataset_config:
+      _target_: dvgt.datasets.scene_dataset.DVGTSceneDataset
+      aug_pixel_aspect_range: [0.8, 1.0]    # Constrain max scale to 1 to avoid extra padding
+      aug_safe_scales: [0.8, 1.2]     # Safe range for fx / fy
+      enable_random_resize: True
+      gt_scale_factor: ${gt_scale_factor}
+      inside_random: True
+      enable_point_in_ego_n: ${enable_point_in_ego_n}
+      enable_point_in_ego_first: ${enable_point_in_ego_first}
+      future_frame_num: ${future_frame_num}
+      enable_past_ego: ${enable_past_ego}
+      enable_ego_status: ${enable_ego_status}
+      mode: train
+      clip_split_type: default_train
+    dataset_config:
+      # dataset_len determines the dataset sampling ratio, which is proportional to the number of scenes.
+      # With 1000 iters per train epoch on 128 GPUs, the total train len must be at least: 128 * 1000 * 8 (avg bs) = 1,024,000.
+      # Thus, scaling each scene count by 100 gives a total train len of 2,116,200. Each worker takes ~8MB memory, which is acceptable.
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/openscene_total_train.parquet
+        original_fps: 2
+        dataset_len: 1937600  # ×100
+        frame_num_max: 38
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/nuscene_train.parquet
+        original_fps: 2
+        dataset_len: 140000   # ×200
+        frame_num_max: 40
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/kitti_train.parquet
+        original_fps: 10
+        dataset_len: 138000   # ×1000
+        frame_num_max: 62
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/waymo_train.parquet
+        original_fps: 10
+        dataset_len: 159600   # ×200
+        frame_num_max: 39
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/ddad_train.parquet
+        original_fps: 10
+        dataset_len: 150000   # ×1000
+        frame_num_max: 16
+    composed_dataset_config:
+      _target_: dvgt.datasets.composed_dataset.ComposedDataset
+      training: True
+      # Augmentation Params
+      cojitter: True
+      cojitter_ratio: 0.3
+      color_jitter:
+        brightness: 0.5
+        contrast: 0.5
+        saturation: 0.5
+        hue: 0.1
+        p: 0.9
+      gray_scale: True
+      gau_blur: False
+    sampler_config:
+      _target_: dvgt.datasets.sampler.GroupedDynamicBatchSampler
+      max_img_per_gpu: ${max_img_per_gpu}
+      view_num_range: [2, 8]
+      aspect_ratio_range: [1.6, 3.3]
+      min_frame_num: 2   # Requires at least 2 frames
+      # Shuffling in PyTorch DataLoader can sometimes copy large dicts and exceed CPU memory
+      # (see: https://github.com/pytorch/pytorch/issues/13246).
+      # To avoid this, set shuffle=False and enable common_config.inside_random=True instead.
+      shuffle: False
+      drop_last: False
+      fixed_batch_size: -1
+  val:
+    _target_: dvgt.datasets.loader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    training: False
+    common_dataset_config:
+      _target_: dvgt.datasets.scene_dataset.DVGTSceneDataset
+      enable_random_resize: False
+      gt_scale_factor: ${gt_scale_factor}
+      inside_random: False
+      enable_point_in_ego_n: ${enable_point_in_ego_n}
+      enable_point_in_ego_first: ${enable_point_in_ego_first}
+      future_frame_num: ${future_frame_num}
+      enable_past_ego: ${enable_past_ego}
+      enable_ego_status: ${enable_ego_status}
+      enable_ray_depth: True    # Required during evaluation
+      fixed_num_frames: 16
+      mode: val
+      filter_lidar: True    # During training, evaluate only dense depth, not LiDAR depth
+      clip_split_type: DVGT1
+    dataset_config:
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/kitti_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 3.3
+      # Sample 200 scenes for faster validation during training
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/openscene_test_sample_200.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/nuscene_val.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/waymo_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/ddad_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 1.6
+    composed_dataset_config:
+      _target_: dvgt.datasets.composed_dataset.ComposedDataset
+      training: False

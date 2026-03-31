@@ -1,0 +1,40 @@
+# @package _global_
+
+defaults:
+  - /train/dvgt2/default_mlp_head.yaml
+  - _self_
+
+log_dir: output/dvgt2/eval/geometry/default_mlp_head
+checkpoint_path: ckpt/dvgt2_mlp_head.pt
+
+data_conf:
+  val:
+    common_dataset_config:
+      future_frame_num: 0
+      clip_split_type: DVGT1
+      fixed_num_frames: 16
+    dataset_config:
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/kitti_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 3.3
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/openscene_test.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/nuscene_val.parquet
+        original_fps: 2
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/waymo_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 1.77
+      - parquet_path: data_annotation/meta/moge_v2_large_correct_focal/moge_pred_filter_parquet/ddad_val.parquet
+        original_fps: 10
+        fixed_aspect_ratio: 1.6
+
+model_wrapper_conf:
+  _target_: dvgt.evaluation.models.dvgt2.DVGT2Wrapper
+  model_config: ${model}
+  eval_config:
+    gt_scale_factor: ${gt_scale_factor}
+    # Window size for streaming evaluation. Set > 0 to enable; -1 for full-sequence offline inference.
+    infer_window: -1    
+    eval_traj: False
