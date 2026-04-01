@@ -1,7 +1,16 @@
 # DVGT: Driving Visual Geometry Transformer
 **DVGT** is a comprehensive autonomous driving framework that leverages dense 3D geometry as the foundation for perception and planning. This repository hosts the official implementation of the DVGT series: from reconstructing metric-scaled dense point maps across diverse datasets (**DVGT-1**) to introducing an efficient Vision-Geometry-Action (VGA) paradigm for online joint reconstruction and planning (**DVGT-2**). 
 
-***Check our project pages ([DVGT-1](https://wzzheng.net/DVGT/), [DVGT-2](https://wzzheng.net/DVGT-2/)) for videos and interactive results!***
+***Check our project pages ([DVGT-1](https://wzzheng.net/DVGT/), [DVGT-2](https://wzzheng.net/DVGT-2/)) for full demo videos and interactive results!***
+
+## 🚀 DVGT-2 Demos
+
+| Demonstration | Highlight & Description |
+| :--- | :--- |
+| <img src="./assets/demo-1.gif" width="500"> | **Dense Scene Representation**<br><br>Unlike models relying on inverse perspective mapping or sparse perception results, **DVGT-2** reconstructs dense 3D geometry to provide a comprehensive and detailed scene representation. |
+| <img src="./assets/demo-2.gif" width="500"> | **Streaming Reconstruction & Planning**<br><br>Given unposed multi-view image sequences, **DVGT-2** performs joint geometry reconstruction and trajectory planning in a fully online manner for continuous and robust driving. |
+| <img src="./assets/demo-3.gif" width="500"> | **Global Geometry Consistency**<br><br>Operating on online input sequences, **DVGT-2** streamingly infers the global geometry of the entire scene, demonstrating high fidelity and temporal consistency. |
+
 
 ## 📖 Publications
 ### DVGT-2: Vision-Geometry-Action Model for Autonomous Driving at Scale
