@@ -15,7 +15,7 @@
 ## 📖 Publications
 ### DVGT-2: Vision-Geometry-Action Model for Autonomous Driving at Scale
 <div align="center">
-    <a href="https://arxiv.org/abs/2603.xxxxx"><img src="https://img.shields.io/badge/arXiv-2603.xxxxx-b31b1b" alt="arXiv"></a>
+    <a href="https://arxiv.org/abs/2604.00813"><img src="https://img.shields.io/badge/arXiv-2604.00813-b31b1b" alt="arXiv"></a>
     <a href='https://wzzheng.net/DVGT-2/'><img src='https://img.shields.io/badge/Project_Page-Website-green?logo=googlechrome&logoColor=white' alt='Project Page'></a>
     <a href='https://huggingface.co/RainyNight/DVGT-2'><img src='https://img.shields.io/badge/🤗%20Hugging%20Face-DVGT-ffd21e'></a>
 </div>
@@ -38,10 +38,10 @@
 </p>
 
 ## ✨ News
-- **[2026/03/31]** DVGT-1 & DVGT-2: Training, evaluation, and data annotation code released.
-- **[2026/03/31]** DVGT-2 paper released.
-- **[2026/02/24]** DVGT-1 is accepted to CVPR26!
-- **[2025/12/19]** We have released the paper, inference code, and visualization checkpoints.
+- **[2026/04/01]** **DVGT-2:** Paper released.
+- **[2026/03/31]** **DVGT-1 & DVGT-2:** Training, evaluation, and data annotation code released.
+- **[2026/02/24]** **DVGT-1:** 🎉 🎉 Accepted to CVPR 2026!
+- **[2025/12/19]** **DVGT-1:** Paper, inference code, and visualization checkpoints released.
 
 ## 📦 Installation
 
@@ -243,7 +243,7 @@ If you find this project helpful, please consider citing the following paper:
 @article{zuo2026dvgt-2,
   title={DVGT-2: Vision-Geometry-Action Model for Autonomous Driving at Scale}, 
   author={Zuo, Sicheng and Xie, Zixun and Zheng, Wenzhao and Xu, Shaoqing and Li, Fang and Li, Hanbing and Chen, Long and Yang, Zhi-Xin and Lu, Jiwen},
-  journal={arXiv preprint arXiv:2603.xxxxx},
+  journal={arXiv preprint arXiv:2604.00813},
   year={2026}
 }
 ```
