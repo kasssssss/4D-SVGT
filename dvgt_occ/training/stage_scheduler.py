@@ -44,3 +44,23 @@ def stage_b_after_stability_weights() -> LossWeights:
         motion_cons=0.1,
         gs_sparse=0.01,
     )
+
+
+def merge_loss_weights(base: LossWeights, override: LossWeights) -> LossWeights:
+    merged = base.to_dict()
+    for key, value in override.to_dict().items():
+        merged[key] = float(value)
+    return LossWeights(**merged)
+
+
+def resolve_loss_weights(
+    step: int,
+    base: LossWeights = DEFAULT_STAGE_B_SCAFFOLD_WEIGHTS,
+    after_stability: LossWeights | None = None,
+    stability_start_step: int | None = None,
+) -> LossWeights:
+    if after_stability is None or stability_start_step is None:
+        return base
+    if step < int(stability_start_step):
+        return base
+    return merge_loss_weights(base, after_stability)

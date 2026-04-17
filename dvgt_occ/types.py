@@ -52,6 +52,7 @@ class OccHeadOutput:
     occ_logit: torch.Tensor
     sem_logit: torch.Tensor
     dyn_occ_logit: torch.Tensor
+    aux_decoder_full: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -76,6 +77,7 @@ class GaussianOutput:
     confidence: torch.Tensor
     instance_affinity: torch.Tensor
     motion_code: torch.Tensor
+    aux_decoder_full: Optional[torch.Tensor] = None
 
 
 @dataclass

@@ -43,7 +43,7 @@ class OccHead(nn.Module):
         points: torch.Tensor,
         points_conf: torch.Tensor,
     ) -> OccHeadOutput:
-        _, p2, _ = self.decoder(*features.as_tuple())
+        _, p2, full = self.decoder(*features.as_tuple())
         p2 = p2 + dynamic.dyn_feat_1_4
         volume = self.lift(p2, points=points, points_conf=points_conf)
         b, t, c, nz, ny, nx = volume.shape
@@ -60,6 +60,7 @@ class OccHead(nn.Module):
             occ_logit=self.occ_head(flat).reshape(b, t, 1, nz, ny, nx),
             sem_logit=self.sem_head(flat).reshape(b, t, -1, nz, ny, nx),
             dyn_occ_logit=self.dyn_head(flat).reshape(b, t, 1, nz, ny, nx),
+            aux_decoder_full=full,
         )
 
     @staticmethod

@@ -17,7 +17,7 @@ class GSHead(nn.Module):
         self.motion_dim = motion_dim
 
     def forward(self, features: ReassembledFeatures, dynamic: DynamicDenseOutput, xyz_1_8: torch.Tensor) -> GaussianOutput:
-        h2, _, _ = self.decoder(*features.as_tuple())
+        h2, _, full = self.decoder(*features.as_tuple())
         b, t, v, c, h, w = h2.shape
         dyn = torch.nn.functional.interpolate(
             dynamic.dyn_logit_1_4.reshape(b * t * v, 1, *dynamic.dyn_logit_1_4.shape[-2:]),
@@ -54,4 +54,5 @@ class GSHead(nn.Module):
             confidence=torch.sigmoid(confidence),
             instance_affinity=instance_affinity,
             motion_code=motion_code,
+            aux_decoder_full=full,
         )

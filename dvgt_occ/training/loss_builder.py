@@ -78,10 +78,12 @@ class DVGTOccLossBuilder(nn.Module):
         losses["sem_proj_2d"] = self._loss_sem_proj_2d(outputs, batch)
         losses["motion_cons"] = self._loss_motion_cons(outputs, batch)
         losses["gs_sparse"] = self._loss_gs_sparse(outputs, batch)
+        losses["ddp_tether"] = self._loss_ddp_tether(outputs)
 
         total = _zero_like(reference)
         for key, weight in asdict(self.weights).items():
             total = total + float(weight) * losses[key]
+        total = total + losses["ddp_tether"]
         return total, losses
 
     def _loss_dyn_soft(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -300,6 +302,18 @@ class DVGTOccLossBuilder(nn.Module):
     def _loss_gs_sparse(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         opacity = outputs["gaussians"].opacity
         return opacity.mean()
+
+    def _loss_ddp_tether(self, outputs: Dict[str, object]) -> torch.Tensor:
+        reference = outputs["dynamic"].dyn_logit_1_4
+        tether = _zero_like(reference)
+        tether = tether + outputs["dynamic"].dyn_logit_full.sum() * 0.0
+        occ_aux = getattr(outputs["occ"], "aux_decoder_full", None)
+        if occ_aux is not None:
+            tether = tether + occ_aux.sum() * 0.0
+        gs_aux = getattr(outputs.get("gaussians_pre_merge", outputs["gaussians"]), "aux_decoder_full", None)
+        if gs_aux is not None:
+            tether = tether + gs_aux.sum() * 0.0
+        return tether
 
     def _build_query_targets_hungarian(
         self,
