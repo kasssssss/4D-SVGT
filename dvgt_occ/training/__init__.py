@@ -7,7 +7,7 @@ from .batch import (
     move_batch_to_device,
 )
 from .loss_builder import DVGTOccLossBuilder
-from .metrics import binary_iou_from_logits, reduce_metrics
+from .metrics import binary_iou_from_logits, binary_stats_from_logits, reduce_metrics
 from .stage_scheduler import (
     DEFAULT_STAGE_B_SCAFFOLD_WEIGHTS,
     LossWeights,
@@ -24,6 +24,7 @@ __all__ = [
     "resolve_loss_weights",
     "stage_b_after_stability_weights",
     "binary_iou_from_logits",
+    "binary_stats_from_logits",
     "reduce_metrics",
     "collate_dvgt_occ_batch",
     "move_batch_to_device",

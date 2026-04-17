@@ -1,0 +1,85 @@
+data:
+  manifest: data/nuscenes_dvgt_v0/manifest_trainval.json
+  output_root: data/nuscenes_dvgt_v0
+  train_scene_ids: ["000", "001", "002", "003", "005", "006", "007", "008"]
+  val_scene_ids: ["004", "009"]
+  train_limit: null
+  val_limit: null
+
+model:
+  num_frames: 8
+  num_views: 6
+  image_height: 224
+  image_width: 448
+  selected_layers: [4, 11, 17, 23]
+  dynamic_query_dim: 256
+  instance_dim: 32
+  motion_dim: 16
+  dynamic_classes: 8
+  semantic_classes: 18
+  projected_semantic_classes: 8
+  max_track_queries: 64
+  new_queries: 64
+  sparse_dynamic_anchors: 2048
+
+train:
+  seed: 42
+  batch_size: 1
+  num_workers: 2
+  max_steps: 4000
+  log_interval: 20
+  save_interval: 250
+  val_interval: 250
+  val_batches: 0
+  amp: true
+  gradient_checkpointing: true
+  grad_clip: 1.0
+  warmup_iters: 1500
+  min_lr: 1.0e-6
+  stability_start_step: 1000000
+  allow_tf32: true
+  log_dir: data/nuscenes_dvgt_v0/logs/train_stage_c_4gpu_run1
+  resume: data/nuscenes_dvgt_v0/logs/train_stage_c_2gpu_run1/step_001250.pt
+
+ddp:
+  backend: nccl
+  timeout_sec: 1800
+  find_unused_parameters: false
+  broadcast_buffers: false
+  static_graph: false
+
+optimizer:
+  base_lr: 2.0e-4
+  gs_lr: 1.0e-4
+  bridge_lr: 1.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 1.0e-4
+
+loss_weights:
+  base:
+    dyn_soft: 1.0
+    presence: 0.5
+    query_match: 0.5
+    query_cls: 1.0
+    query_box3d: 2.0
+    track_mem_feat: 0.25
+    track_mem_box: 0.5
+    birth_death: 0.25
+    occ: 1.0
+    sem_occ: 1.0
+    dyn_occ: 0.5
+    inst_contrast: 0.2
+    query2gs: 0.5
+    q2gs_null: 0.25
+    mask_render: 1.0
+    occ_local2gs: 0.0
+    gs2occ_local: 0.0
+    sem_proj_2d: 0.0
+    motion_cons: 0.0
+    gs_sparse: 0.0
+  after_stability:
+    occ_local2gs: 0.1
+    gs2occ_local: 0.1
+    sem_proj_2d: 0.25
+    motion_cons: 0.1
+    gs_sparse: 0.01

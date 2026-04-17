@@ -36,6 +36,7 @@ from dvgt_occ.training import (
     DVGTOccLossBuilder,
     LossWeights,
     binary_iou_from_logits,
+    binary_stats_from_logits,
     collate_dvgt_occ_batch,
     move_batch_to_device,
     reduce_metrics,
@@ -302,19 +303,24 @@ def evaluate(
     loss_totals: Dict[str, torch.Tensor] = {}
     denom = 0
     for batch_idx, batch in enumerate(loader):
-        if batch_idx >= max_batches:
+        if max_batches > 0 and batch_idx >= max_batches:
             break
         batch = move_batch_to_device(batch, device)
         outputs = model(batch)
         loss_total, loss_dict = loss_builder(outputs, batch)
+        occ_logits = outputs["occ"].occ_logit
+        occ_target = batch["occ_label"]
+        dyn_logits = torch.logit(outputs["render"].render_alpha_dynamic.clamp(1e-4, 1.0 - 1e-4))
+        dyn_target = batch["sam3_dyn_mask_full"].unsqueeze(3)
         metrics = {
             "val_loss_total": loss_total.detach(),
-            "val_occ_iou": binary_iou_from_logits(outputs["occ"].occ_logit, batch["occ_label"]),
-            "val_dyn_mask_iou": binary_iou_from_logits(
-                torch.logit(outputs["render"].render_alpha_dynamic.clamp(1e-4, 1.0 - 1e-4)),
-                batch["sam3_dyn_mask_full"].unsqueeze(3),
-            ),
+            "val_occ_iou": binary_iou_from_logits(occ_logits, occ_target),
+            "val_dyn_mask_iou": binary_iou_from_logits(dyn_logits, dyn_target),
         }
+        for key, value in binary_stats_from_logits(occ_logits, occ_target).items():
+            metrics[f"val_occ_{key}"] = value
+        for key, value in binary_stats_from_logits(dyn_logits, dyn_target).items():
+            metrics[f"val_dyn_mask_{key}"] = value
         for key, value in loss_dict.items():
             metrics[f"val_loss_{key}"] = value.detach()
         for key, value in metrics.items():
