@@ -1,0 +1,59 @@
+# Stage-A data/cache scaffold for DVGT-SAM3-DGGT-Occ.
+source_root: ../nuscenes_processed_10Hz
+output_root: data/nuscenes_dvgt_v0
+manifest: data/nuscenes_dvgt_v0/manifest_trainval.json
+split: trainval
+clip:
+  num_frames: 8
+  num_views: 6
+  source_hz: 10
+  dvgt_hz: 2
+  source_stride: 5
+  clip_stride: 40
+  image_size: [224, 448]
+  view_ids: [0, 1, 2, 3, 4, 5]
+dvgt_cache:
+  selected_layers: [4, 11, 17, 23]
+  mode: full
+  checkpoint: pretrained/dvgt2.pt
+  amp_dtype: bfloat16
+  required_files:
+    - points.npy
+    - points_conf.npy
+    - ego_pose.npy
+    - feat_l4.npy
+    - feat_l11.npy
+    - feat_l17.npy
+    - feat_l23.npy
+supervision:
+  sam3:
+    root: /lustre/fs12/portfolios/nvr/projects/nvr_lpr_nvgptvision/users/shihaow/driving_data/sam3
+    checkpoint: /lustre/fs12/portfolios/nvr/projects/nvr_lpr_nvgptvision/users/shihaow/driving_data/sam3_ckpt/sam3.pt
+    window_len: 64
+    overlap: 16
+    prompts:
+      - car
+      - truck
+      - bus
+      - trailer
+      - construction vehicle
+      - pedestrian
+      - bicycle
+      - motorcycle
+  required_files:
+    - dyn_soft_mask_1_4.npy
+    - gs_local_inst_id_1_8.npy
+    - gs_global_track_id_1_8.npy
+    - inst_boundary_weight_1_8.npy
+    - inst_area_ratio_1_8.npy
+    - inst_quality_mask_1_8.npy
+    - track_boxes_3d.npy
+    - track_cls.npy
+    - track_id.npy
+    - track_visible.npy
+    - track_birth.npy
+    - track_death.npy
+    - track_delta_box.npy
+    - occ_label.npy
+    - occ_sem_label.npy
+    - occ_dyn_label.npy

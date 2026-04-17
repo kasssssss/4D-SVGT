@@ -1,0 +1,72 @@
+"""Shared token reassembly from frozen DVGT tokens to four 2D feature scales."""
+
+from __future__ import annotations
+
+from typing import Mapping, Optional, Sequence
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from dvgt_occ.types import ReassembledFeatures
+
+
+class TokenReassembly(nn.Module):
+    def __init__(
+        self,
+        selected_layers: Sequence[int] = (4, 11, 17, 23),
+        in_dim: int = 3072,
+        out_dim: int = 256,
+        patch_grid: Sequence[int] = (14, 28),
+        special_tokens: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.selected_layers = tuple(selected_layers)
+        self.patch_grid = tuple(patch_grid)
+        self.special_tokens = special_tokens
+        self.projections = nn.ModuleDict({str(layer): nn.Conv2d(in_dim, out_dim, 1) for layer in self.selected_layers})
+
+    def forward(self, aggregated_tokens: Mapping[int, torch.Tensor]) -> ReassembledFeatures:
+        projected = []
+        for layer in self.selected_layers:
+            if layer not in aggregated_tokens:
+                raise KeyError(f"Missing DVGT layer {layer}; available={list(aggregated_tokens.keys())}")
+            tokens = aggregated_tokens[layer]
+            projected.append(self._project(tokens, self.projections[str(layer)]))
+
+        # The selected DVGT layers are single-scale patch grids. We expose a DPT
+        # style pyramid so each downstream head receives the same contract.
+        f1 = F.interpolate(projected[0], size=(56, 112), mode="bilinear", align_corners=False)
+        f2 = F.interpolate(projected[1], size=(28, 56), mode="bilinear", align_corners=False)
+        f3 = projected[2]
+        f4 = F.interpolate(projected[3], size=(7, 14), mode="bilinear", align_corners=False)
+        return ReassembledFeatures(
+            f1=self._unflatten(f1, aggregated_tokens[self.selected_layers[0]]),
+            f2=self._unflatten(f2, aggregated_tokens[self.selected_layers[0]]),
+            f3=self._unflatten(f3, aggregated_tokens[self.selected_layers[0]]),
+            f4=self._unflatten(f4, aggregated_tokens[self.selected_layers[0]]),
+        )
+
+    def _project(self, tokens: torch.Tensor, projection: nn.Module) -> torch.Tensor:
+        if tokens.ndim != 5:
+            raise ValueError(f"Expected tokens [B,T,V,N,C], got {tuple(tokens.shape)}")
+        b, t, v, n, c = tokens.shape
+        hp, wp = self.patch_grid
+        patch_count = hp * wp
+        special_tokens = self.special_tokens if self.special_tokens is not None else n - patch_count
+        if special_tokens < 0:
+            raise ValueError(f"Token count {n} is smaller than expected patch count {patch_count}")
+        patch_tokens = tokens[:, :, :, special_tokens:, :]
+        if patch_tokens.shape[3] != hp * wp:
+            raise ValueError(
+                f"Expected {hp * wp} patch tokens after {special_tokens} special tokens, "
+                f"got {patch_tokens.shape[3]}"
+            )
+        x = patch_tokens.reshape(b * t * v, hp, wp, c).permute(0, 3, 1, 2).contiguous()
+        return projection(x)
+
+    @staticmethod
+    def _unflatten(x: torch.Tensor, reference_tokens: torch.Tensor) -> torch.Tensor:
+        b, t, v = reference_tokens.shape[:3]
+        c, h, w = x.shape[1:]
+        return x.reshape(b, t, v, c, h, w)

@@ -1,3 +1,15 @@
+# 4D-SVGT
+
+This repository contains my thesis engineering code for an instance-aware 4D Gaussian + occupancy driving system built on top of DVGT. It keeps the original DVGT codebase and adds the `dvgt_occ/`, `tools/dvgt_occ/`, and `configs/dvgt_occ/` pipeline for data preparation, supervision building, and Stage-B training scaffolding.
+
+Project notes:
+
+- Project spec: [目标.md](./目标.md)
+- Ongoing implementation log: [进度.md](./进度.md)
+- Main added package: [dvgt_occ](./dvgt_occ)
+
+The original DVGT README is preserved below for upstream context.
+
 # DVGT: Driving Visual Geometry Transformer
 **DVGT** is a comprehensive autonomous driving framework that leverages dense 3D geometry as the foundation for perception and planning. This repository hosts the official implementation of the DVGT series: from reconstructing metric-scaled dense point maps across diverse datasets (**DVGT-1**) to introducing an efficient Vision-Geometry-Action (VGA) paradigm for online joint reconstruction and planning (**DVGT-2**). 
 

@@ -152,6 +152,11 @@ logs
 .gradio
 output
 ckpt/
+data/
+pretrained/
+*.sqsh
+nohup.out
+*.pid
 data_annotation
 public_datasets
 temp*
