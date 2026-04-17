@@ -79,6 +79,11 @@ class DVGTOccModel(nn.Module):
         )
         self.mask_renderer = GaussianMaskRenderer(output_size=(config.image_height, config.image_width))
 
+    def enable_gradient_checkpointing(self, enabled: bool = True) -> None:
+        self.dynamic_dense.set_gradient_checkpointing(enabled)
+        self.occ_head.set_gradient_checkpointing(enabled)
+        self.gs_head.set_gradient_checkpointing(enabled)
+
     def forward(self, batch: dict) -> dict:
         features = self.reassembly(batch["aggregated_tokens"])
         points = batch["points"]

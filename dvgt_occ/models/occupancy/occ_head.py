@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from dvgt_occ.models.decoders import OccDenseDecoder
 from dvgt_occ.types import DynamicDenseOutput, OccHeadOutput, ReassembledFeatures
@@ -23,6 +24,7 @@ class OccHead(nn.Module):
     ) -> None:
         super().__init__()
         self.decoder = OccDenseDecoder(channels=channels, full_channels=128)
+        self.gradient_checkpointing = False
         self.lift = Lift2DTo3D(
             channels=channels,
             occ_shape_zyx=occ_shape_zyx,
@@ -36,6 +38,9 @@ class OccHead(nn.Module):
         self.sem_head = nn.Conv3d(channels, semantic_classes, 1)
         self.dyn_head = nn.Conv3d(channels, 1, 1)
 
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        self.gradient_checkpointing = enabled
+
     def forward(
         self,
         features: ReassembledFeatures,
@@ -43,7 +48,10 @@ class OccHead(nn.Module):
         points: torch.Tensor,
         points_conf: torch.Tensor,
     ) -> OccHeadOutput:
-        _, p2, full = self.decoder(*features.as_tuple())
+        if self.gradient_checkpointing and self.training:
+            _, p2, full = checkpoint(self.decoder, *features.as_tuple(), use_reentrant=False)
+        else:
+            _, p2, full = self.decoder(*features.as_tuple())
         p2 = p2 + dynamic.dyn_feat_1_4
         volume = self.lift(p2, points=points, points_conf=points_conf)
         b, t, c, nz, ny, nx = volume.shape

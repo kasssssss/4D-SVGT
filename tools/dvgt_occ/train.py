@@ -131,6 +131,7 @@ def build_runtime_config(args: argparse.Namespace, cfg: Dict[str, object]) -> Di
         "val_batches": int(args.val_batches if args.val_batches is not None else train_cfg.get("val_batches", 32)),
         "grad_clip": float(train_cfg.get("grad_clip", 1.0)),
         "amp": bool(train_cfg.get("amp", True)),
+        "gradient_checkpointing": bool(train_cfg.get("gradient_checkpointing", False)),
         "warmup_iters": int(train_cfg.get("warmup_iters", 1500)),
         "min_lr": float(train_cfg.get("min_lr", 1e-6)),
         "stability_start_step": int(train_cfg.get("stability_start_step", 0)),
@@ -358,6 +359,9 @@ def main() -> None:
             )
 
         model = DVGTOccModel(config=model_cfg).to(device)
+        raw_model = model
+        if runtime["gradient_checkpointing"] and hasattr(raw_model, "enable_gradient_checkpointing"):
+            raw_model.enable_gradient_checkpointing(True)
         if ddp_enabled:
             model = DistributedDataParallel(
                 model,

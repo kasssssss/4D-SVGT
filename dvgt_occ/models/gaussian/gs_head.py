@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from dvgt_occ.models.decoders import GSDenseDecoder
 from dvgt_occ.types import DynamicDenseOutput, GaussianOutput, ReassembledFeatures
@@ -11,13 +12,20 @@ class GSHead(nn.Module):
     def __init__(self, channels: int = 256, instance_dim: int = 32, motion_dim: int = 16) -> None:
         super().__init__()
         self.decoder = GSDenseDecoder(channels=channels, full_channels=128)
+        self.gradient_checkpointing = False
         out_dim = 3 + 1 + 3 + 4 + 3 + 1 + instance_dim + motion_dim
         self.head = nn.Sequential(nn.Conv2d(channels + 1, channels, 3, padding=1), nn.GELU(), nn.Conv2d(channels, out_dim, 1))
         self.instance_dim = instance_dim
         self.motion_dim = motion_dim
 
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        self.gradient_checkpointing = enabled
+
     def forward(self, features: ReassembledFeatures, dynamic: DynamicDenseOutput, xyz_1_8: torch.Tensor) -> GaussianOutput:
-        h2, _, full = self.decoder(*features.as_tuple())
+        if self.gradient_checkpointing and self.training:
+            h2, _, full = checkpoint(self.decoder, *features.as_tuple(), use_reentrant=False)
+        else:
+            h2, _, full = self.decoder(*features.as_tuple())
         b, t, v, c, h, w = h2.shape
         dyn = torch.nn.functional.interpolate(
             dynamic.dyn_logit_1_4.reshape(b * t * v, 1, *dynamic.dyn_logit_1_4.shape[-2:]),
