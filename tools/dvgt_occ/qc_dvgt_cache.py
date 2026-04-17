@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dvgt_occ.config import DEFAULT_DVGT_OCC_CONFIG
 from dvgt_occ.data.manifest import load_manifest
+from dvgt_occ.data.dataset import DVGTOccClipDataset
 from cache_dvgt import _amp_dtype, _build_model, _load_images
 
 
@@ -36,6 +37,7 @@ def _select_entry(entries: list[dict], scene_id: str | None, clip_id: str | None
 
 
 def _load_cache(cache_dir: Path, config) -> dict[str, np.ndarray]:
+    metric_scale = DVGTOccClipDataset._resolve_points_metric_scale(cache_dir)
     arrays = {
         "points": np.load(cache_dir / "points.npy", allow_pickle=False),
         "points_conf": np.load(cache_dir / "points_conf.npy", allow_pickle=False),
@@ -43,6 +45,7 @@ def _load_cache(cache_dir: Path, config) -> dict[str, np.ndarray]:
     }
     for layer in config.selected_layers:
         arrays[f"feat_l{layer}"] = np.load(cache_dir / f"feat_l{layer}.npy", allow_pickle=False)
+    arrays["_points_metric_scale"] = np.array(metric_scale, dtype=np.float32)
     return arrays
 
 
@@ -170,46 +173,75 @@ def main() -> None:
         rerun[f"feat_l{layer}"] = aggregated_tokens_list[layer].squeeze(0).detach().cpu().to(torch.float16).numpy()
 
     cached = _load_cache(cache_dir, config)
+    cached_metric_points = (cached["points"].astype(np.float32) * float(cached["_points_metric_scale"])).astype(np.float32)
     summary = {
         "scene_id": str(entry["scene_id"]),
         "clip_id": str(entry["clip_id"]),
         "frame_ids_10hz": list(entry["frame_ids_10hz"]),
         "view_ids": list(entry["view_ids"]),
         "patch_start_idx_rerun": int(patch_start_idx),
+        "legacy_cache_points_metric_scale": float(cached["_points_metric_scale"]),
         "comparisons": {
             "points": _compare_arrays(rerun["points"], cached["points"]),
             "points_conf": _compare_arrays(rerun["points_conf"], cached["points_conf"]),
+            "points_metric_after_loader_scale": _compare_arrays(
+                rerun["points"].astype(np.float32) * float(cached["_points_metric_scale"]),
+                cached_metric_points,
+            ),
         },
     }
     for layer in config.selected_layers:
         summary["comparisons"][f"feat_l{layer}"] = _compare_arrays(rerun[f"feat_l{layer}"], cached[f"feat_l{layer}"])
 
-    xyz, conf_values, view_idx = _flatten_points(
+    xyz_raw, conf_values_raw, view_idx_raw = _flatten_points(
         cached["points"],
         cached["points_conf"],
         conf_percentile=float(args.conf_percentile),
         max_depth=float(args.max_depth),
     )
-    summary["point_cloud_stats"] = {
-        "filtered_points": int(xyz.shape[0]),
+    xyz_metric, conf_values_metric, view_idx_metric = _flatten_points(
+        cached_metric_points,
+        cached["points_conf"],
+        conf_percentile=float(args.conf_percentile),
+        max_depth=float(args.max_depth) * float(cached["_points_metric_scale"]),
+    )
+    summary["point_cloud_stats_raw_cache"] = {
+        "filtered_points": int(xyz_raw.shape[0]),
         "conf_percentile": float(args.conf_percentile),
         "max_depth": float(args.max_depth),
-        "xyz_min": xyz.min(axis=0).astype(float).tolist(),
-        "xyz_max": xyz.max(axis=0).astype(float).tolist(),
-        "xyz_mean": xyz.mean(axis=0).astype(float).tolist(),
+        "xyz_min": xyz_raw.min(axis=0).astype(float).tolist(),
+        "xyz_max": xyz_raw.max(axis=0).astype(float).tolist(),
+        "xyz_mean": xyz_raw.mean(axis=0).astype(float).tolist(),
+    }
+    summary["point_cloud_stats_metric"] = {
+        "filtered_points": int(xyz_metric.shape[0]),
+        "conf_percentile": float(args.conf_percentile),
+        "metric_scale": float(cached["_points_metric_scale"]),
+        "max_depth": float(args.max_depth) * float(cached["_points_metric_scale"]),
+        "xyz_min": xyz_metric.min(axis=0).astype(float).tolist(),
+        "xyz_max": xyz_metric.max(axis=0).astype(float).tolist(),
+        "xyz_mean": xyz_metric.mean(axis=0).astype(float).tolist(),
     }
 
     _plot_point_cloud(
-        xyz,
-        conf_values,
-        view_idx,
-        qc_dir / "dvgt_cache_point_cloud.png",
-        title=f"DVGT cache scene {entry['scene_id']} {entry['clip_id']}",
+        xyz_raw,
+        conf_values_raw,
+        view_idx_raw,
+        qc_dir / "dvgt_cache_point_cloud_raw.png",
+        title=f"DVGT cache raw scene {entry['scene_id']} {entry['clip_id']}",
+    )
+    _plot_point_cloud(
+        xyz_metric,
+        conf_values_metric,
+        view_idx_metric,
+        qc_dir / "dvgt_cache_point_cloud_metric.png",
+        title=f"DVGT cache metric scene {entry['scene_id']} {entry['clip_id']}",
     )
     (qc_dir / "qc_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
     print(f"[qc] wrote {qc_dir / 'qc_summary.json'}")
-    print(f"[qc] wrote {qc_dir / 'dvgt_cache_point_cloud.png'}")
+    print(f"[qc] wrote {qc_dir / 'dvgt_cache_point_cloud_raw.png'}")
+    print(f"[qc] wrote {qc_dir / 'dvgt_cache_point_cloud_metric.png'}")
 
 
 if __name__ == "__main__":

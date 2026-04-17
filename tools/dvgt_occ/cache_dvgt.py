@@ -35,6 +35,8 @@ OUTPUT_FILES = (
     "feat_l23.npy",
 )
 
+DEFAULT_DVGT_GT_SCALE_FACTOR = 0.1
+
 
 def _load_images(entry: dict, output_root: Path, size_hw: tuple[int, int]):
     import torch
@@ -171,6 +173,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, default=Path("pretrained/dvgt2.pt"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--amp-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--gt-scale-factor", type=float, default=DEFAULT_DVGT_GT_SCALE_FACTOR)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--scene-ids", nargs="*", default=None)
     parser.add_argument("--clip-ids", nargs="*", default=None)
@@ -202,6 +205,7 @@ def main() -> None:
     model = _build_model(checkpoint, device)
     config = DEFAULT_DVGT_OCC_CONFIG
     amp_dtype = _amp_dtype(args.amp_dtype)
+    points_metric_scale = 1.0 / float(args.gt_scale_factor) if float(args.gt_scale_factor) != 0.0 else 1.0
     built = 0
     skipped = 0
     for entry in entries:
@@ -226,7 +230,8 @@ def main() -> None:
                 frames_chunk_size=model.frames_chunk_size,
             )
 
-        np.save(cache_dir / "points.npy", points.squeeze(0).detach().cpu().float().numpy().astype(np.float32))
+        points_metric = points.squeeze(0).detach().cpu().float().numpy().astype(np.float32) * np.float32(points_metric_scale)
+        np.save(cache_dir / "points.npy", points_metric)
         np.save(cache_dir / "points_conf.npy", points_conf.squeeze(0).detach().cpu().float().numpy().astype(np.float32))
         np.save(cache_dir / "ego_pose.npy", relative_ego_poses(dirs["source_scene"], entry["frame_ids_10hz"]))
         np.save(cache_dir / "patch_start_idx.npy", np.array([patch_start_idx], dtype=np.int64))
@@ -242,6 +247,9 @@ def main() -> None:
                     "image_shape": [config.image_height, config.image_width],
                     "token_dtype": "float16",
                     "geometry_dtype": "float32",
+                    "gt_scale_factor": float(args.gt_scale_factor),
+                    "points_metric_scale": float(points_metric_scale),
+                    "cache_points_are_metric": True,
                 },
                 indent=2,
             ),
