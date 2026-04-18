@@ -34,8 +34,13 @@ if [[ -n "$TORCHRUN_BIN" ]]; then
   TORCHRUN_CMD=("$TORCHRUN_BIN")
 elif command -v torchrun >/dev/null 2>&1; then
   TORCHRUN_CMD=("$(command -v torchrun)")
-else
+elif command -v python >/dev/null 2>&1 && python -c "import torch" >/dev/null 2>&1; then
+  TORCHRUN_CMD=(python -m torch.distributed.run)
+elif command -v python3 >/dev/null 2>&1 && python3 -c "import torch" >/dev/null 2>&1; then
   TORCHRUN_CMD=(python3 -m torch.distributed.run)
+else
+  echo "Could not find a torchrun binary or a Python interpreter with torch installed." >&2
+  exit 1
 fi
 
 "${TORCHRUN_CMD[@]}" \

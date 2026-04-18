@@ -5,6 +5,8 @@ data:
   val_scene_ids: ["004", "009"]
   train_limit: null
   val_limit: null
+  val_dynamic_only: true
+  val_min_dynamic_pixels: 256
 
 model:
   num_frames: 8
@@ -21,26 +23,27 @@ model:
   max_track_queries: 64
   new_queries: 64
   sparse_dynamic_anchors: 2048
+  gs_bias_scale: 0.75
 
 train:
   seed: 42
   batch_size: 1
-  num_workers: 2
-  max_steps: 4000
-  log_interval: 20
-  save_interval: 250
-  val_interval: 250
-  val_batches: 0
+  num_workers: 0
+  max_steps: 300
+  log_interval: 10
+  save_interval: 40
+  val_interval: 40
+  val_batches: 16
   amp: true
   gradient_checkpointing: true
   grad_clip: 1.0
-  warmup_iters: 1500
+  warmup_iters: 100
   min_lr: 1.0e-6
   stability_start_step: 1000000
   allow_tf32: true
-  log_dir: data/nuscenes_dvgt_v0/logs/train_stage_c_4gpu_run1
-  resume: data/nuscenes_dvgt_v0/logs/train_stage_c_2gpu_run1/step_001250.pt
-  visualize_every_epochs: 100
+  log_dir: data/nuscenes_dvgt_v0/logs/train_stage_c_4gpu_pilot_v5_stable
+  resume: null
+  visualize_every_epochs: 25
   visualize_frame_index: 0
   visualize_view_index: 0
   visualize_sample_index: 0
@@ -73,6 +76,7 @@ loss_weights:
     occ: 1.0
     sem_occ: 1.0
     dyn_occ: 0.5
+    gs_render: 1.0
     inst_contrast: 0.2
     query2gs: 0.5
     q2gs_null: 0.25

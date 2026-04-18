@@ -54,9 +54,17 @@ class DVGTOccModel(nn.Module):
             y_range=config.occ_grid.y_range,
             z_range=config.occ_grid.z_range,
         )
-        self.gs_head = GSHead(channels=config.neck_dim, instance_dim=config.instance_dim, motion_dim=config.motion_dim)
+        self.gs_head = GSHead(
+            channels=config.neck_dim,
+            instance_dim=config.instance_dim,
+            motion_dim=config.motion_dim,
+            bias_scale=config.gs_bias_scale,
+        )
         self.gaussian_merge = GaussianMultiViewMerge()
-        self.gaussian_assignment = GaussianQueryAssignment()
+        self.gaussian_assignment = GaussianQueryAssignment(
+            query_dim=config.dynamic_query_dim,
+            gaussian_feat_dim=config.instance_dim + config.motion_dim,
+        )
         self.gs_occ_local_bridge = GSOccLocalBridge(
             occ_channels=config.neck_dim,
             gs_channels=config.instance_dim + config.motion_dim,
@@ -76,8 +84,15 @@ class DVGTOccModel(nn.Module):
             semantic_classes=config.semantic_classes,
             projected_classes=config.projected_semantic_classes,
             output_size=(config.image_height, config.image_width),
+            x_range=config.occ_grid.x_range,
+            y_range=config.occ_grid.y_range,
+            z_range=config.occ_grid.z_range,
+            voxel_size=config.occ_grid.voxel_size,
         )
-        self.mask_renderer = GaussianMaskRenderer(output_size=(config.image_height, config.image_width))
+        self.mask_renderer = GaussianMaskRenderer(
+            output_size=(config.image_height, config.image_width),
+            splat_radius=config.render_splat_radius,
+        )
 
     def enable_gradient_checkpointing(self, enabled: bool = True) -> None:
         self.dynamic_dense.set_gradient_checkpointing(enabled)
@@ -107,8 +122,21 @@ class DVGTOccModel(nn.Module):
         bridges = self._run_bridges(gaussians_merged, occ)
         entities = self.entity_aggregator(gaussians_merged, queries, assignment)
         entities = self._inject_bridge_context(entities, bridges)
-        sem_proj_2d = self.occ_semantic_projector(occ.occ_logit, occ.sem_logit, num_views=self.config.num_views)
-        render = self.mask_renderer(gaussians_merged, assignment, sem_proj_2d)
+        sem_proj_2d = self.occ_semantic_projector(
+            occ.occ_logit,
+            occ.sem_logit,
+            camera_intrinsics=batch["camera_intrinsics"],
+            camera_to_world=batch["camera_to_world"],
+            first_ego_pose_world=batch["first_ego_pose_world"],
+        )
+        render = self.mask_renderer(
+            gaussians_merged,
+            assignment,
+            sem_proj_2d,
+            camera_intrinsics=batch["camera_intrinsics"],
+            camera_to_world=batch["camera_to_world"],
+            first_ego_pose_world=batch["first_ego_pose_world"],
+        )
         return {
             "dynamic": dynamic,
             "occ": occ,

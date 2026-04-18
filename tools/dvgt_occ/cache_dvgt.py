@@ -248,7 +248,7 @@ def main() -> None:
                     "token_dtype": "float16",
                     "geometry_dtype": "float32",
                     "gt_scale_factor": float(args.gt_scale_factor),
-                    "points_metric_scale": float(points_metric_scale),
+                    "points_metric_scale": 1.0,
                     "cache_points_are_metric": True,
                 },
                 indent=2,

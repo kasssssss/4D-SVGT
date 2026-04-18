@@ -45,6 +45,8 @@ class DVGTOccConfig:
     sparse_dynamic_anchors: int = 2048
     global_latents: int = 128
     occ_samples_per_scale: int = 8
+    gs_bias_scale: float = 0.75
+    render_splat_radius: int = 4
     selected_layers: Tuple[int, ...] = (4, 11, 17, 23)
     camera_view_ids: Tuple[int, ...] = CAMERA_VIEW_IDS
     occ_grid: OccGridConfig = field(default_factory=OccGridConfig)

@@ -74,10 +74,14 @@ class GaussianOutput:
     scale: torch.Tensor
     rotation: torch.Tensor
     feat_dc: torch.Tensor
-    confidence: torch.Tensor
+    keep_score: torch.Tensor
     instance_affinity: torch.Tensor
     motion_code: torch.Tensor
     aux_decoder_full: Optional[torch.Tensor] = None
+
+    @property
+    def confidence(self) -> torch.Tensor:
+        return self.keep_score
 
 
 @dataclass
@@ -86,6 +90,10 @@ class GaussianAssignmentOutput:
     assigned_query: torch.Tensor
     background_prob: torch.Tensor
     local_gate: torch.Tensor
+    foreground_logit: Optional[torch.Tensor] = None
+    background_logit: Optional[torch.Tensor] = None
+    feature_similarity: Optional[torch.Tensor] = None
+    routing_keep_score: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -105,7 +113,12 @@ class BridgeOutput:
 
 @dataclass
 class RenderOutput:
+    render_rgb_static: torch.Tensor
+    render_rgb_dynamic: torch.Tensor
+    render_rgb_all: torch.Tensor
     render_alpha_static: torch.Tensor
     render_alpha_dynamic: torch.Tensor
     render_alpha_all: torch.Tensor
     sem_proj_2d: torch.Tensor
+    debug_mean_sigma: Optional[torch.Tensor] = None
+    debug_touch_ratio: Optional[torch.Tensor] = None

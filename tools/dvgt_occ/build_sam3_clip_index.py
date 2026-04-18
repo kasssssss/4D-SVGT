@@ -38,6 +38,10 @@ OUTPUT_FILES = (
 )
 
 
+def _record_accepted_for_training(record: dict) -> bool:
+    return bool(record.get("quality_ok", False)) and (not bool(record.get("box_like_flag", False)))
+
+
 def _load_scene_records(scene_dir: Path, view_ids: Iterable[int]) -> Dict[int, Dict[int, List[dict]]]:
     records: Dict[int, Dict[int, List[dict]]] = defaultdict(lambda: defaultdict(list))
     for view_id in view_ids:
@@ -108,29 +112,29 @@ def _derive_frame_supervision(records: List[dict], dynamic_scores: Dict[int, np.
     global_ratio = np.zeros((28, 56), dtype=np.float32)
 
     for record in records:
+        accepted = _record_accepted_for_training(record)
         mask = rle_to_binary_mask(record["rle"])
         ratio_1_4 = resize_mask_float(mask, (56, 112))
         ratio_1_8 = resize_mask_float(mask, (28, 56))
         boundary_1_8 = resize_mask_float(binary_mask_boundary(mask), (28, 56))
-        boundary_weight = np.maximum(boundary_weight, boundary_1_8)
-        if record["quality_ok"]:
+        if accepted:
+            boundary_weight = np.maximum(boundary_weight, boundary_1_8)
             dyn_score = dynamic_scores.get(int(record.get("global_weak_id", -1)))
             if dyn_score is not None and t_idx < len(dyn_score):
                 score = float(dyn_score[t_idx])
             else:
                 score = _fallback_dynamic_score(record)
             dyn_soft = np.maximum(dyn_soft, ratio_1_4 * score)
+            local_update = ratio_1_8 > local_ratio
+            local_map[local_update] = int(record["local_mask_id"])
+            local_ratio[local_update] = ratio_1_8[local_update]
+            area_ratio[local_update] = ratio_1_8[local_update]
+            quality_mask[local_update] = 1.0
 
-        local_update = ratio_1_8 > local_ratio
-        local_map[local_update] = int(record["local_mask_id"])
-        local_ratio[local_update] = ratio_1_8[local_update]
-        area_ratio[local_update] = ratio_1_8[local_update]
-        quality_mask[local_update] = 1.0 if record["quality_ok"] else 0.0
-
-        if int(record.get("global_weak_id", -1)) >= 0:
-            global_update = ratio_1_8 > global_ratio
-            global_map[global_update] = int(record["global_weak_id"])
-            global_ratio[global_update] = ratio_1_8[global_update]
+            if int(record.get("global_weak_id", -1)) >= 0:
+                global_update = ratio_1_8 > global_ratio
+                global_map[global_update] = int(record["global_weak_id"])
+                global_ratio[global_update] = ratio_1_8[global_update]
 
     return dyn_soft, local_map, global_map, boundary_weight, area_ratio, quality_mask
 
@@ -229,10 +233,11 @@ def main() -> None:
         clip_index["sam3_scene_dir"] = entry.get("sam3_scene_dir")
         clip_index_path.write_text(json.dumps(clip_index, indent=2), encoding="utf-8")
         built += 1
-        quality_ok_count = sum(1 for record in clip_index["records"].values() if record["quality_ok"])
+        quality_ok_count = sum(1 for record in clip_index["records"].values() if bool(record.get("quality_ok", False)))
+        accepted_count = sum(1 for record in clip_index["records"].values() if _record_accepted_for_training(record))
         print(
             f"[sam3_clip][{shard_index}/{num_shards}] {entry['scene_id']}/{entry['clip_id']} "
-            f"records={len(clip_index['records'])} quality_ok={quality_ok_count}"
+            f"records={len(clip_index['records'])} quality_ok={quality_ok_count} accepted={accepted_count}"
         )
 
     print(f"Built SAM3 clip supervision for {built} clips; skipped {skipped}; shard {shard_index}/{num_shards}.")

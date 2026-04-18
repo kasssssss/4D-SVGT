@@ -13,6 +13,8 @@ from dvgt_occ.config import DVGTOccConfig
 from dvgt_occ.models.dynamic import match_queries_to_tracks
 from dvgt_occ.training.stage_scheduler import DEFAULT_STAGE_B_SCAFFOLD_WEIGHTS, LossWeights
 
+INVALID_MATCH_COST = 1e5
+
 
 def _zero_like(reference: torch.Tensor) -> torch.Tensor:
     return reference.new_zeros(())
@@ -44,6 +46,32 @@ def _soft_dice_loss_from_logits(pred: torch.Tensor, target: torch.Tensor, eps: f
     return 1.0 - dice.mean()
 
 
+def _masked_balanced_bce_with_logits(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    valid = (valid > 0.5).float()
+    if valid.shape != pred.shape:
+        valid = valid.expand_as(pred)
+    if float(valid.sum().item()) <= 0:
+        return _zero_like(pred)
+    pred_valid = pred[valid > 0.5]
+    target_valid = target.float()[valid > 0.5]
+    return _balanced_bce_with_logits(pred_valid, target_valid)
+
+
+def _masked_soft_dice_loss_from_logits(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    valid = (valid > 0.5).float()
+    if valid.shape != pred.shape:
+        valid = valid.expand_as(pred)
+    if float(valid.sum().item()) <= 0:
+        return _zero_like(pred)
+    prob = torch.sigmoid(pred) * valid
+    target = target.float() * valid
+    dims = tuple(range(1, prob.ndim))
+    inter = (prob * target).sum(dim=dims)
+    denom = prob.sum(dim=dims) + target.sum(dim=dims)
+    dice = (2.0 * inter + eps) / (denom + eps)
+    return 1.0 - dice.mean()
+
+
 def _safe_logit(prob: torch.Tensor) -> torch.Tensor:
     return torch.logit(prob.clamp(1e-4, 1.0 - 1e-4))
 
@@ -57,6 +85,17 @@ class DVGTOccLossBuilder(nn.Module):
         super().__init__()
         self.config = config
         self.weights = weights
+        self._lpips = None
+        self._lpips_available = False
+        try:
+            import lpips  # type: ignore
+
+            self._lpips = lpips.LPIPS(net="alex")
+            self._lpips.requires_grad_(False)
+            self._lpips_available = True
+        except Exception:
+            self._lpips = None
+            self._lpips_available = False
 
     def forward(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         reference = outputs["dynamic"].dyn_logit_1_4
@@ -70,6 +109,7 @@ class DVGTOccLossBuilder(nn.Module):
         losses["occ"] = self._loss_occ(outputs, batch)
         losses["sem_occ"] = self._loss_sem_occ(outputs, batch)
         losses["dyn_occ"] = self._loss_dyn_occ(outputs, batch)
+        losses["gs_render"] = self._loss_gs_render(outputs, batch)
         losses["inst_contrast"] = self._loss_instance_contrast(outputs, batch)
         losses["query2gs"], losses["q2gs_null"] = self._loss_query_to_gaussian(outputs, batch)
         losses["mask_render"] = self._loss_dyn_mask_full(outputs, batch)
@@ -95,10 +135,17 @@ class DVGTOccLossBuilder(nn.Module):
         if "sam3_dyn_mask_full" in batch and "render" in outputs:
             pred_dyn = _safe_logit(outputs["render"].render_alpha_dynamic.squeeze(3))
             target_dyn = batch["sam3_dyn_mask_full"]
-            loss_dyn = _balanced_bce_with_logits(pred_dyn, target_dyn) + _soft_dice_loss_from_logits(pred_dyn, target_dyn)
+            valid = batch.get("sam3_valid_mask_full")
+            if valid is not None:
+                loss_dyn = _masked_balanced_bce_with_logits(pred_dyn, target_dyn, valid) + _masked_soft_dice_loss_from_logits(pred_dyn, target_dyn, valid)
+            else:
+                loss_dyn = _balanced_bce_with_logits(pred_dyn, target_dyn) + _soft_dice_loss_from_logits(pred_dyn, target_dyn)
             pred_all = _safe_logit(outputs["render"].render_alpha_all.squeeze(3))
             target_all = batch.get("sam3_all_mask_full", target_dyn)
-            loss_all = _balanced_bce_with_logits(pred_all, target_all) + _soft_dice_loss_from_logits(pred_all, target_all)
+            if valid is not None:
+                loss_all = _masked_balanced_bce_with_logits(pred_all, target_all, valid) + _masked_soft_dice_loss_from_logits(pred_all, target_all, valid)
+            else:
+                loss_all = _balanced_bce_with_logits(pred_all, target_all) + _soft_dice_loss_from_logits(pred_all, target_all)
             return loss_dyn + 0.25 * loss_all
 
         pred = outputs["dynamic"].dyn_logit_full.squeeze(3)
@@ -112,10 +159,28 @@ class DVGTOccLossBuilder(nn.Module):
         ).reshape(b, t, v, pred.shape[-2], pred.shape[-1])
         return _balanced_bce_with_logits(pred, target_full) + _soft_dice_loss_from_logits(pred, target_full)
 
+    def _loss_gs_render(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if "render" not in outputs or "rgb_target" not in batch or "points_conf" not in batch:
+            return _zero_like(outputs["dynamic"].dyn_logit_1_4)
+
+        pred = outputs["render"].render_rgb_all
+        target = batch["rgb_target"]
+        conf = batch["points_conf"]
+        valid = self._build_render_valid_mask(conf)
+        valid_sum = valid.sum().clamp_min(1.0)
+        l1 = ((pred - target).abs() * valid).sum() / valid_sum
+
+        if self._lpips_available and self._lpips is not None:
+            lpips_loss = self._masked_lpips(pred, target, valid)
+        else:
+            lpips_loss = self._multiscale_l1(pred, target, valid)
+        lpips_weight = 0.05 * min(float(self._current_step_hint(outputs, batch)) / 1000.0, 1.0)
+        return l1 + lpips_weight * lpips_loss
+
     def _loss_occ(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         pred = outputs["occ"].occ_logit.squeeze(2)
         target = batch["occ_label"]
-        return F.binary_cross_entropy_with_logits(pred, target)
+        return _balanced_bce_with_logits(pred, target) + _soft_dice_loss_from_logits(pred, target)
 
     def _loss_sem_occ(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         pred = outputs["occ"].sem_logit
@@ -126,7 +191,7 @@ class DVGTOccLossBuilder(nn.Module):
     def _loss_dyn_occ(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         pred = outputs["occ"].dyn_occ_logit.squeeze(2)
         target = batch["occ_dyn_label"]
-        return F.binary_cross_entropy_with_logits(pred, target)
+        return _balanced_bce_with_logits(pred, target) + _soft_dice_loss_from_logits(pred, target)
 
     def _loss_queries(
         self,
@@ -293,7 +358,11 @@ class DVGTOccLossBuilder(nn.Module):
             return _zero_like(outputs["dynamic"].dyn_logit_1_4)
         pred = outputs["render"].sem_proj_2d
         target = batch["sam3_semantic_full"]
-        return _balanced_bce_with_logits(pred, target) + _soft_dice_loss_from_logits(pred, target)
+        valid = batch.get("sam3_valid_mask_full")
+        if valid is None:
+            return _balanced_bce_with_logits(pred, target) + _soft_dice_loss_from_logits(pred, target)
+        valid = valid.unsqueeze(3)
+        return _masked_balanced_bce_with_logits(pred, target, valid) + _masked_soft_dice_loss_from_logits(pred, target, valid)
 
     def _loss_motion_cons(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         gauss_motion = outputs["gaussians"].motion_code[..., : outputs["entities"].refined_motion_code.shape[-1]]
@@ -303,16 +372,72 @@ class DVGTOccLossBuilder(nn.Module):
         opacity = outputs["gaussians"].opacity
         return opacity.mean()
 
+    def _build_render_valid_mask(self, points_conf: torch.Tensor, threshold: float = 0.30, dilate_px: int = 5) -> torch.Tensor:
+        b, t, v, h, w = points_conf.shape
+        mask = (points_conf > threshold).float().reshape(b * t * v, 1, h, w)
+        if dilate_px > 0:
+            kernel = dilate_px * 2 + 1
+            mask = F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=dilate_px)
+        return mask.reshape(b, t, v, 1, h, w)
+
+    def _masked_lpips(self, pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        b, t, v, c, h, w = pred.shape
+        pred_m = (pred * valid).reshape(b * t * v, c, h, w)
+        tgt_m = (target * valid).reshape(b * t * v, c, h, w)
+        lpips_module = self._lpips.to(pred.device)
+        value = lpips_module(pred_m * 2.0 - 1.0, tgt_m * 2.0 - 1.0)
+        return value.mean()
+
+    def _multiscale_l1(self, pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        loss = _zero_like(pred)
+        pred_s = pred
+        target_s = target
+        valid_s = valid
+        for _ in range(3):
+            denom = valid_s.sum().clamp_min(1.0)
+            loss = loss + ((pred_s - target_s).abs() * valid_s).sum() / denom
+            if pred_s.shape[-1] <= 28 or pred_s.shape[-2] <= 14:
+                break
+            pred_s = F.avg_pool2d(pred_s.reshape(-1, pred_s.shape[3], pred_s.shape[4], pred_s.shape[5]), 2, 2).reshape(
+                pred.shape[0], pred.shape[1], pred.shape[2], pred.shape[3], pred_s.shape[-2] // 2, pred_s.shape[-1] // 2
+            )
+            target_s = F.avg_pool2d(
+                target_s.reshape(-1, target_s.shape[3], target_s.shape[4], target_s.shape[5]), 2, 2
+            ).reshape(pred_s.shape)
+            valid_s = F.avg_pool2d(valid_s.reshape(-1, 1, valid_s.shape[-2], valid_s.shape[-1]), 2, 2).reshape(
+                pred_s.shape[0], pred_s.shape[1], pred_s.shape[2], 1, pred_s.shape[-2], pred_s.shape[-1]
+            )
+            valid_s = (valid_s > 0.25).float()
+        return loss / 3.0
+
+    def _current_step_hint(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> int:
+        step_hint = outputs.get("step_hint")
+        if isinstance(step_hint, torch.Tensor):
+            return int(step_hint.item())
+        if isinstance(step_hint, int):
+            return int(step_hint)
+        return 0
+
     def _loss_ddp_tether(self, outputs: Dict[str, object]) -> torch.Tensor:
         reference = outputs["dynamic"].dyn_logit_1_4
         tether = _zero_like(reference)
         tether = tether + outputs["dynamic"].dyn_logit_full.sum() * 0.0
+        queries = outputs.get("queries")
+        if queries is not None:
+            tether = tether + queries.query_cls_logit.sum() * 0.0
+            tether = tether + queries.query_motion.sum() * 0.0
         occ_aux = getattr(outputs["occ"], "aux_decoder_full", None)
         if occ_aux is not None:
             tether = tether + occ_aux.sum() * 0.0
         gs_aux = getattr(outputs.get("gaussians_pre_merge", outputs["gaussians"]), "aux_decoder_full", None)
         if gs_aux is not None:
             tether = tether + gs_aux.sum() * 0.0
+        bridges = outputs.get("bridges")
+        if bridges is not None:
+            tether = tether + bridges.gs_to_occ_local.sum() * 0.0
+        render = outputs.get("render")
+        if render is not None:
+            tether = tether + render.sem_proj_2d.sum() * 0.0
         return tether
 
     def _build_query_targets_hungarian(
@@ -359,14 +484,16 @@ class DVGTOccLossBuilder(nn.Module):
                 )
                 matched_queries = torch.nonzero(match.query_to_gt >= 0, as_tuple=False).squeeze(-1)
                 if matched_queries.numel() > 0:
-                    gt_slots = match.query_to_gt[matched_queries]
-                    matched_gt_slot[batch_idx, time_idx, matched_queries] = gt_slots
-                    cls_target[batch_idx, time_idx, matched_queries] = track_cls[batch_idx, time_idx, gt_slots]
-                    box_target[batch_idx, time_idx, matched_queries] = target_source[batch_idx, time_idx, gt_slots]
-                    visible_mask[batch_idx, time_idx, matched_queries] = True
-                    match_cost[batch_idx, time_idx, matched_queries] = match.query_match_cost[matched_queries].to(
+                    valid_queries = matched_queries[match.query_match_cost[matched_queries] < INVALID_MATCH_COST]
+                    if valid_queries.numel() > 0:
+                        gt_slots = match.query_to_gt[valid_queries]
+                        matched_gt_slot[batch_idx, time_idx, valid_queries] = gt_slots
+                        cls_target[batch_idx, time_idx, valid_queries] = track_cls[batch_idx, time_idx, gt_slots]
+                        box_target[batch_idx, time_idx, valid_queries] = target_source[batch_idx, time_idx, gt_slots]
+                        visible_mask[batch_idx, time_idx, valid_queries] = True
+                        match_cost[batch_idx, time_idx, valid_queries] = match.query_match_cost[valid_queries].to(
                         match_cost.dtype
-                    )
+                        )
 
                 prev_feat = query_feat[batch_idx, time_idx].detach()
                 prev_id = match.query_to_track_id.detach()

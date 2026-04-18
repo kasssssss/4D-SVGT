@@ -38,6 +38,8 @@ def _select_entry(entries: list[dict], scene_id: str | None, clip_id: str | None
 
 def _load_cache(cache_dir: Path, config) -> dict[str, np.ndarray]:
     metric_scale = DVGTOccClipDataset._resolve_points_metric_scale(cache_dir)
+    meta_path = cache_dir / "cache_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
     arrays = {
         "points": np.load(cache_dir / "points.npy", allow_pickle=False),
         "points_conf": np.load(cache_dir / "points_conf.npy", allow_pickle=False),
@@ -46,6 +48,8 @@ def _load_cache(cache_dir: Path, config) -> dict[str, np.ndarray]:
     for layer in config.selected_layers:
         arrays[f"feat_l{layer}"] = np.load(cache_dir / f"feat_l{layer}.npy", allow_pickle=False)
     arrays["_points_metric_scale"] = np.array(metric_scale, dtype=np.float32)
+    arrays["_gt_scale_factor"] = np.array(float(meta.get("gt_scale_factor", 0.1)), dtype=np.float32)
+    arrays["_cache_points_are_metric"] = np.array(bool(meta.get("cache_points_are_metric", False)))
     return arrays
 
 
@@ -173,7 +177,14 @@ def main() -> None:
         rerun[f"feat_l{layer}"] = aggregated_tokens_list[layer].squeeze(0).detach().cpu().to(torch.float16).numpy()
 
     cached = _load_cache(cache_dir, config)
-    cached_metric_points = (cached["points"].astype(np.float32) * float(cached["_points_metric_scale"])).astype(np.float32)
+    gt_scale_factor = float(cached["_gt_scale_factor"])
+    cache_points_are_metric = bool(cached["_cache_points_are_metric"])
+    if cache_points_are_metric:
+        cached_metric_points = cached["points"].astype(np.float32)
+        cached_raw_points = (cached_metric_points * np.float32(gt_scale_factor)).astype(np.float32)
+    else:
+        cached_raw_points = cached["points"].astype(np.float32)
+        cached_metric_points = (cached_raw_points * float(cached["_points_metric_scale"])).astype(np.float32)
     summary = {
         "scene_id": str(entry["scene_id"]),
         "clip_id": str(entry["clip_id"]),
@@ -181,11 +192,13 @@ def main() -> None:
         "view_ids": list(entry["view_ids"]),
         "patch_start_idx_rerun": int(patch_start_idx),
         "legacy_cache_points_metric_scale": float(cached["_points_metric_scale"]),
+        "gt_scale_factor": gt_scale_factor,
+        "cache_points_are_metric": cache_points_are_metric,
         "comparisons": {
-            "points": _compare_arrays(rerun["points"], cached["points"]),
+            "points_raw": _compare_arrays(rerun["points"], cached_raw_points),
             "points_conf": _compare_arrays(rerun["points_conf"], cached["points_conf"]),
-            "points_metric_after_loader_scale": _compare_arrays(
-                rerun["points"].astype(np.float32) * float(cached["_points_metric_scale"]),
+            "points_metric": _compare_arrays(
+                rerun["points"].astype(np.float32) * np.float32(1.0 / gt_scale_factor),
                 cached_metric_points,
             ),
         },

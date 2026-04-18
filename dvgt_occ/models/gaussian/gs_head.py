@@ -9,7 +9,13 @@ from dvgt_occ.types import DynamicDenseOutput, GaussianOutput, ReassembledFeatur
 
 
 class GSHead(nn.Module):
-    def __init__(self, channels: int = 256, instance_dim: int = 32, motion_dim: int = 16) -> None:
+    def __init__(
+        self,
+        channels: int = 256,
+        instance_dim: int = 32,
+        motion_dim: int = 16,
+        bias_scale: float = 0.75,
+    ) -> None:
         super().__init__()
         self.decoder = GSDenseDecoder(channels=channels, full_channels=128)
         self.gradient_checkpointing = False
@@ -17,6 +23,7 @@ class GSHead(nn.Module):
         self.head = nn.Sequential(nn.Conv2d(channels + 1, channels, 3, padding=1), nn.GELU(), nn.Conv2d(channels, out_dim, 1))
         self.instance_dim = instance_dim
         self.motion_dim = motion_dim
+        self.bias_scale = float(bias_scale)
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
         self.gradient_checkpointing = enabled
@@ -40,26 +47,27 @@ class GSHead(nn.Module):
         cursor += 3
         opacity = raw[..., cursor : cursor + 1]
         cursor += 1
-        scale = raw[..., cursor : cursor + 3]
+        scale_raw = raw[..., cursor : cursor + 3]
         cursor += 3
         rotation = raw[..., cursor : cursor + 4]
         cursor += 4
         feat_dc = raw[..., cursor : cursor + 3]
         cursor += 3
-        confidence = raw[..., cursor : cursor + 1]
+        keep_score = raw[..., cursor : cursor + 1]
         cursor += 1
         instance_affinity = raw[..., cursor : cursor + self.instance_dim]
         cursor += self.instance_dim
         motion_code = raw[..., cursor : cursor + self.motion_dim]
         center = xyz_1_8.permute(0, 1, 2, 4, 5, 3).contiguous() + offset
+        scale = torch.exp((scale_raw + self.bias_scale).clamp(min=-6.0, max=4.0))
         return GaussianOutput(
             center=center,
             offset=offset,
             opacity=torch.sigmoid(opacity),
-            scale=torch.nn.functional.softplus(scale),
+            scale=scale,
             rotation=torch.nn.functional.normalize(rotation, dim=-1),
             feat_dc=torch.sigmoid(feat_dc),
-            confidence=torch.sigmoid(confidence),
+            keep_score=torch.sigmoid(keep_score),
             instance_affinity=instance_affinity,
             motion_code=motion_code,
             aux_decoder_full=full,

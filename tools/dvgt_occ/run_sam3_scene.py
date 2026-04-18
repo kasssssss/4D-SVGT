@@ -473,6 +473,50 @@ def _write_instances_jsonl_atomic(path: Path, records: list[dict]) -> None:
     tmp_path.replace(path)
 
 
+def _build_frames_meta(records: list[dict], frame_ids_10hz: list[int], view_id: int) -> list[dict]:
+    by_frame: Dict[int, list[dict]] = defaultdict(list)
+    for record in records:
+        by_frame[int(record["frame_id_10hz"])].append(record)
+    frames_meta: list[dict] = []
+    for scene_frame_index, frame_id in enumerate(frame_ids_10hz):
+        frame_records = by_frame.get(int(frame_id), [])
+        quality_masks = []
+        rejected = 0
+        for record in frame_records:
+            if bool(record.get("quality_ok", False)) and (not bool(record.get("box_like_flag", False))):
+                quality_masks.append(rle_to_binary_mask(record["rle"]))
+            else:
+                rejected += 1
+        exhaustive_ok = bool(quality_masks) and rejected == 0
+        valid_region_rle = None
+        if (not exhaustive_ok) and quality_masks:
+            union = np.logical_or.reduce(quality_masks)
+            valid_region_rle = binary_mask_to_rle(union)
+        frames_meta.append(
+            {
+                "scene_frame_index": int(scene_frame_index),
+                "frame_id_10hz": int(frame_id),
+                "view_id": int(view_id),
+                "exhaustive_ok": bool(exhaustive_ok),
+                "valid_region_rle": valid_region_rle,
+                "quality_ok_count": int(len(quality_masks)),
+                "rejected_count": int(rejected),
+            }
+        )
+    return frames_meta
+
+
+def _write_frames_meta_jsonl(path: Path, records: list[dict], frame_ids_10hz: list[int], view_id: int) -> None:
+    frames_meta = _build_frames_meta(records, frame_ids_10hz, view_id)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        for record in frames_meta:
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp_path.replace(path)
+
+
 def _assign_global_weak_ids(records: list[dict], scene_dir: Path, scene_frame_ids: list[int], view_id: int) -> None:
     if not records:
         return
@@ -606,6 +650,7 @@ def main() -> None:
             (sam3_scene_dir / "scene_meta.json").write_text(json.dumps(scene_meta, indent=2), encoding="utf-8")
             for view_id in scene_view_ids:
                 out_path = sam3_scene_dir / f"view_{view_id}" / "instances.jsonl"
+                frames_meta_path = sam3_scene_dir / f"view_{view_id}" / "frames_meta.jsonl"
                 partial_path = sam3_scene_dir / f"view_{view_id}" / "instances.partial.jsonl"
                 progress_path = sam3_scene_dir / f"view_{view_id}" / "progress.json"
                 if _instances_jsonl_complete(out_path) and not args.overwrite:
@@ -667,6 +712,7 @@ def main() -> None:
                 all_records = _dedupe_records(all_records)
                 _assign_global_weak_ids(all_records, scene_dir, scene_frame_ids, int(view_id))
                 _write_instances_jsonl_atomic(out_path, all_records)
+                _write_frames_meta_jsonl(frames_meta_path, all_records, scene_frame_ids, int(view_id))
                 partial_path.unlink(missing_ok=True)
                 _write_progress(
                     progress_path,

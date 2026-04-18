@@ -8,6 +8,15 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+try:
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+except Exception:  # pragma: no cover - fallback for minimal envs
+    np = None
+    linear_sum_assignment = None
+
+INVALID_COST = 1e6
+
 
 @dataclass
 class QueryTrackMatchResult:
@@ -30,6 +39,15 @@ def _hungarian_assignment(cost: list[list[float]]) -> list[int]:
         return [-1] * rows
     if rows > cols:
         raise ValueError("Hungarian solver expects rows <= cols.")
+
+    if linear_sum_assignment is not None and np is not None:
+        matrix = np.asarray(cost, dtype=np.float64)
+        matrix = np.nan_to_num(matrix, nan=INVALID_COST, posinf=INVALID_COST, neginf=INVALID_COST)
+        row_ind, col_ind = linear_sum_assignment(matrix)
+        assignment = [-1] * rows
+        for row_idx, col_idx in zip(row_ind.tolist(), col_ind.tolist()):
+            assignment[int(row_idx)] = int(col_idx)
+        return assignment
 
     u = [0.0] * (rows + 1)
     v = [0.0] * (cols + 1)
@@ -147,6 +165,12 @@ def match_queries_to_tracks(
         + 0.20 * cls_cost
         + 0.10 * motion_cost
         + 0.05 * feature_cost
+    )
+    total_cost = torch.nan_to_num(
+        total_cost,
+        nan=INVALID_COST,
+        posinf=INVALID_COST,
+        neginf=INVALID_COST,
     )
 
     assignment = _hungarian_assignment(total_cost.detach().cpu().tolist())

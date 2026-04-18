@@ -19,6 +19,7 @@ class LossWeights:
     occ: float = 1.0
     sem_occ: float = 1.0
     dyn_occ: float = 0.5
+    gs_render: float = 1.0
     inst_contrast: float = 0.2
     query2gs: float = 0.5
     q2gs_null: float = 0.25

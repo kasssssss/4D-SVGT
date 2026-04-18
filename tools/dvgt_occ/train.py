@@ -8,8 +8,12 @@ import json
 import math
 import os
 import random
+import signal
+import socket
+import time
 from datetime import timedelta
 from dataclasses import asdict
+from dataclasses import is_dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
@@ -18,7 +22,7 @@ import torch
 import torch.distributed as dist
 import yaml
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 import sys
@@ -38,9 +42,14 @@ from dvgt_occ.training import (
     binary_iou_from_logits,
     binary_stats_from_logits,
     collate_dvgt_occ_batch,
+    masked_l1,
+    masked_psnr,
     move_batch_to_device,
     reduce_metrics,
+    render_valid_mask_from_points_conf,
     resolve_loss_weights,
+    soft_iou_from_logits,
+    save_training_visualization,
     stage_b_after_stability_weights,
 )
 
@@ -65,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-interval", type=int, default=None)
     parser.add_argument("--val-batches", type=int, default=None)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--ddp-timeout-sec", type=int, default=None)
     parser.add_argument("--ddp-backend", type=str, default=None)
     parser.add_argument("--find-unused-parameters", action="store_true")
@@ -130,6 +140,8 @@ def build_runtime_config(args: argparse.Namespace, cfg: Dict[str, object]) -> Di
         "save_interval": int(args.save_interval if args.save_interval is not None else train_cfg.get("save_interval", 2000)),
         "val_interval": int(args.val_interval if args.val_interval is not None else train_cfg.get("val_interval", 2000)),
         "val_batches": int(args.val_batches if args.val_batches is not None else train_cfg.get("val_batches", 32)),
+        "val_dynamic_only": bool(data_cfg.get("val_dynamic_only", False)),
+        "val_min_dynamic_pixels": int(data_cfg.get("val_min_dynamic_pixels", 32)),
         "grad_clip": float(train_cfg.get("grad_clip", 1.0)),
         "amp": bool(train_cfg.get("amp", True)),
         "gradient_checkpointing": bool(train_cfg.get("gradient_checkpointing", False)),
@@ -138,12 +150,17 @@ def build_runtime_config(args: argparse.Namespace, cfg: Dict[str, object]) -> Di
         "stability_start_step": int(train_cfg.get("stability_start_step", 0)),
         "allow_tf32": bool(train_cfg.get("allow_tf32", True)),
         "log_dir": Path(args.log_dir or train_cfg.get("log_dir", "data/nuscenes_dvgt_v0/logs/train_stage")),
+        "visualize_every_epochs": int(train_cfg.get("visualize_every_epochs", 100)),
+        "visualize_frame_index": int(train_cfg.get("visualize_frame_index", 0)),
+        "visualize_view_index": int(train_cfg.get("visualize_view_index", 0)),
+        "visualize_sample_index": int(train_cfg.get("visualize_sample_index", 0)),
+        "visualize_max_scene_points": int(train_cfg.get("visualize_max_scene_points", 20000)),
         "find_unused_parameters": bool(args.find_unused_parameters or ddp_cfg.get("find_unused_parameters", False)),
         "broadcast_buffers": bool(args.broadcast_buffers or ddp_cfg.get("broadcast_buffers", False)),
         "static_graph": bool(ddp_cfg.get("static_graph", False)),
         "ddp_timeout_sec": int(args.ddp_timeout_sec or ddp_cfg.get("timeout_sec", 1800)),
         "ddp_backend": str(args.ddp_backend or ddp_cfg.get("backend", "nccl")),
-        "resume": Path(args.resume or train_cfg.get("resume", "")) if (args.resume or train_cfg.get("resume")) else None,
+        "resume": None if args.no_resume else (Path(args.resume or train_cfg.get("resume", "")) if (args.resume or train_cfg.get("resume")) else None),
     }
     return runtime
 
@@ -173,6 +190,8 @@ def build_model_config(cfg: Dict[str, object]) -> DVGTOccConfig:
         "sparse_dynamic_anchors": int(model_cfg.get("sparse_dynamic_anchors", base.sparse_dynamic_anchors)),
         "global_latents": int(model_cfg.get("global_latents", base.global_latents)),
         "occ_samples_per_scale": int(model_cfg.get("occ_samples_per_scale", base.occ_samples_per_scale)),
+        "gs_bias_scale": float(model_cfg.get("gs_bias_scale", base.gs_bias_scale)),
+        "render_splat_radius": int(model_cfg.get("render_splat_radius", base.render_splat_radius)),
         "selected_layers": tuple(model_cfg.get("selected_layers", list(base.selected_layers))),
         "camera_view_ids": tuple(model_cfg.get("camera_view_ids", list(base.camera_view_ids))),
         "occ_grid": base.occ_grid,
@@ -266,6 +285,26 @@ def build_dataset(
     )
 
 
+def select_dynamic_subset(dataset: DVGTOccClipDataset, min_dynamic_pixels: int) -> DVGTOccClipDataset | Subset:
+    keep_indices: list[int] = []
+    for idx in range(len(dataset)):
+        sample = dataset[idx]
+        sam3 = sample.get("sam3_fullres")
+        if sam3 is None:
+            continue
+        dyn = sam3["sam3_dyn_mask_full"]
+        valid = sam3.get("sam3_valid_mask_full")
+        if valid is not None:
+            dyn_pixels = int(((dyn > 0.5) & (valid > 0.5)).sum())
+        else:
+            dyn_pixels = int((dyn > 0.5).sum())
+        if dyn_pixels >= int(min_dynamic_pixels):
+            keep_indices.append(idx)
+    if keep_indices:
+        return Subset(dataset, keep_indices)
+    return dataset
+
+
 def build_loader(dataset: DVGTOccClipDataset, batch_size: int, num_workers: int, ddp_enabled: bool, rank: int, world_size: int, shuffle: bool) -> tuple[DataLoader, DistributedSampler | None]:
     sampler = None
     if ddp_enabled:
@@ -282,12 +321,113 @@ def build_loader(dataset: DVGTOccClipDataset, batch_size: int, num_workers: int,
     return loader, sampler
 
 
+def append_jsonl(path: Path, record: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _tensor_nonfinite_summary(name: str, tensor: torch.Tensor) -> Dict[str, object] | None:
+    if tensor.numel() == 0:
+        return None
+    finite = torch.isfinite(tensor)
+    if bool(finite.all().item()):
+        return None
+    total = int(tensor.numel())
+    finite_count = int(finite.sum().item())
+    payload: Dict[str, object] = {
+        "name": name,
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "finite_count": finite_count,
+        "nonfinite_count": total - finite_count,
+    }
+    finite_vals = tensor[finite]
+    if finite_vals.numel() > 0:
+        payload["finite_min"] = float(finite_vals.min().item())
+        payload["finite_max"] = float(finite_vals.max().item())
+    return payload
+
+
+def _collect_nonfinite_tensors(obj: object, prefix: str = "") -> List[Dict[str, object]]:
+    summaries: List[Dict[str, object]] = []
+    if isinstance(obj, torch.Tensor):
+        summary = _tensor_nonfinite_summary(prefix or "tensor", obj.detach())
+        if summary is not None:
+            summaries.append(summary)
+        return summaries
+    if is_dataclass(obj):
+        for key, value in obj.__dict__.items():
+            child_prefix = f"{prefix}.{key}" if prefix else key
+            summaries.extend(_collect_nonfinite_tensors(value, child_prefix))
+        return summaries
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            summaries.extend(_collect_nonfinite_tensors(value, child_prefix))
+        return summaries
+    if isinstance(obj, (list, tuple)):
+        for idx, value in enumerate(obj):
+            child_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            summaries.extend(_collect_nonfinite_tensors(value, child_prefix))
+        return summaries
+    return summaries
+
+
+def _collect_nonfinite_gradients(model: torch.nn.Module) -> List[Dict[str, object]]:
+    bad: List[Dict[str, object]] = []
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        summary = _tensor_nonfinite_summary(name, param.grad.detach())
+        if summary is not None:
+            bad.append(summary)
+    return bad
+
+
+def write_status_json(path: Path, payload: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def save_checkpoint(path: Path, step: int, raw_model: torch.nn.Module, optimizer: torch.optim.Optimizer, score: float | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"step": step, "model": raw_model.state_dict(), "optimizer": optimizer.state_dict()}
     if score is not None:
         payload["score"] = score
     torch.save(payload, path)
+
+
+def collect_debug_metrics(outputs: Dict[str, object]) -> Dict[str, torch.Tensor]:
+    metrics: Dict[str, torch.Tensor] = {}
+    assignment = outputs.get("assignment")
+    if assignment is not None:
+        metrics["debug_assign_bg_mean"] = assignment.background_prob.mean()
+        metrics["debug_assign_fg_max_mean"] = assignment.assignment_prob[..., 1:].max(dim=-1).values.mean()
+        metrics["debug_assign_pos_ratio"] = (assignment.assigned_query >= 0).float().mean()
+        metrics["debug_assign_gate_active"] = (assignment.local_gate > 0.5).float().mean()
+        if assignment.feature_similarity is not None:
+            metrics["debug_assign_feat_sim_mean"] = assignment.feature_similarity.mean()
+        if assignment.routing_keep_score is not None:
+            metrics["debug_assign_routing_keep_mean"] = assignment.routing_keep_score.mean()
+
+    gaussians = outputs.get("gaussians")
+    if gaussians is not None:
+        metrics["debug_gauss_keep_mean"] = gaussians.keep_score.mean()
+        metrics["debug_gauss_opacity_mean"] = gaussians.opacity.mean()
+        metrics["debug_gauss_scale_mean"] = gaussians.scale.mean()
+
+    render = outputs.get("render")
+    if render is not None:
+        metrics["debug_render_alpha_coverage"] = (render.render_alpha_all > 1e-3).float().mean()
+        metrics["debug_render_alpha_mean"] = render.render_alpha_all.mean()
+        if render.debug_mean_sigma is not None:
+            metrics["debug_render_sigma_mean"] = render.debug_mean_sigma
+        if render.debug_touch_ratio is not None:
+            metrics["debug_render_touch_ratio"] = render.debug_touch_ratio
+    return metrics
 
 
 @torch.no_grad()
@@ -307,22 +447,32 @@ def evaluate(
             break
         batch = move_batch_to_device(batch, device)
         outputs = model(batch)
+        outputs["step_hint"] = 0
         loss_total, loss_dict = loss_builder(outputs, batch)
         occ_logits = outputs["occ"].occ_logit
         occ_target = batch["occ_label"]
         dyn_logits = torch.logit(outputs["render"].render_alpha_dynamic.clamp(1e-4, 1.0 - 1e-4))
         dyn_target = batch["sam3_dyn_mask_full"].unsqueeze(3)
+        dyn_valid = batch.get("sam3_valid_mask_full")
+        if dyn_valid is not None:
+            dyn_valid = dyn_valid.unsqueeze(3)
+        render_valid = render_valid_mask_from_points_conf(batch["points_conf"])
         metrics = {
             "val_loss_total": loss_total.detach(),
             "val_occ_iou": binary_iou_from_logits(occ_logits, occ_target),
-            "val_dyn_mask_iou": binary_iou_from_logits(dyn_logits, dyn_target),
+            "val_occ_soft_iou": soft_iou_from_logits(occ_logits, occ_target),
+            "val_dyn_mask_iou": binary_iou_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid),
+            "val_render_l1": masked_l1(outputs["render"].render_rgb_all, batch["rgb_target"], render_valid),
+            "val_render_psnr": masked_psnr(outputs["render"].render_rgb_all, batch["rgb_target"], render_valid),
         }
         for key, value in binary_stats_from_logits(occ_logits, occ_target).items():
             metrics[f"val_occ_{key}"] = value
-        for key, value in binary_stats_from_logits(dyn_logits, dyn_target).items():
+        for key, value in binary_stats_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid).items():
             metrics[f"val_dyn_mask_{key}"] = value
         for key, value in loss_dict.items():
             metrics[f"val_loss_{key}"] = value.detach()
+        for key, value in collect_debug_metrics(outputs).items():
+            metrics[f"val_{key}"] = value.detach()
         for key, value in metrics.items():
             loss_totals[key] = loss_totals.get(key, torch.zeros_like(value)) + value
         denom += 1
@@ -341,6 +491,8 @@ def main() -> None:
         timeout_sec=runtime["ddp_timeout_sec"],
         backend_override=runtime["ddp_backend"],
     )
+    run_start_time = time.time()
+    run_exception: BaseException | None = None
     try:
         model_cfg = build_model_config(cfg)
         set_seed(runtime["seed"] + rank)
@@ -352,6 +504,8 @@ def main() -> None:
         train_scene_ids, val_scene_ids = discover_scene_splits(runtime["manifest"], runtime["train_scene_ids"], runtime["val_scene_ids"])
         train_dataset = build_dataset(runtime["manifest"], runtime["output_root"], model_cfg, train_scene_ids, runtime["train_limit"])
         val_dataset = build_dataset(runtime["manifest"], runtime["output_root"], model_cfg, val_scene_ids, runtime["val_limit"]) if val_scene_ids else None
+        if val_dataset is not None and runtime["val_dynamic_only"]:
+            val_dataset = select_dynamic_subset(val_dataset, runtime["val_min_dynamic_pixels"])
         if len(train_dataset) == 0:
             raise RuntimeError("No training clips selected.")
 
@@ -398,6 +552,8 @@ def main() -> None:
                 "model": asdict(model_cfg),
                 "train_scene_ids": train_scene_ids,
                 "val_scene_ids": val_scene_ids,
+                "val_dynamic_only": runtime["val_dynamic_only"],
+                "val_min_dynamic_pixels": runtime["val_min_dynamic_pixels"],
                 "base_loss_weights": base_weights.to_dict(),
                 "after_stability_loss_weights": after_weights.to_dict(),
                 "ddp": {
@@ -410,10 +566,44 @@ def main() -> None:
                 },
             }
             (log_dir / "train_config.json").write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+            write_status_json(
+                log_dir / "run_status.json",
+                {
+                    "state": "running",
+                    "hostname": socket.gethostname(),
+                    "pid": os.getpid(),
+                    "start_time": run_start_time,
+                    "last_step": start_step - 1,
+                    "last_val_step": None,
+                },
+            )
+
+            def _handle_signal(signum: int, _frame: object) -> None:
+                write_status_json(
+                    log_dir / "run_status.json",
+                    {
+                        "state": "signal_exit",
+                        "hostname": socket.gethostname(),
+                        "pid": os.getpid(),
+                        "start_time": run_start_time,
+                        "last_step": last_train_record["step"] if "last_train_record" in locals() and last_train_record is not None else start_step - 1,
+                        "last_val_step": last_val_record["step"] if "last_val_record" in locals() and last_val_record is not None else None,
+                        "signal": int(signum),
+                        "heartbeat_time": time.time(),
+                    },
+                )
+                raise SystemExit(128 + int(signum))
+
+            signal.signal(signal.SIGTERM, _handle_signal)
+            signal.signal(signal.SIGINT, _handle_signal)
 
         model.train()
         train_iter = iter(train_loader)
         best_score = None
+        last_train_record: dict[str, object] | None = None
+        last_val_record: dict[str, object] | None = None
+        skipped_nonfinite_steps = 0
+        epoch_size = max(len(train_loader), 1)
         for step in range(start_step, runtime["max_steps"]):
             if train_sampler is not None and step % max(len(train_loader), 1) == 0:
                 train_sampler.set_epoch(step)
@@ -434,13 +624,66 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32, enabled=autocast_enabled):
                 outputs = model(batch)
+                outputs["step_hint"] = step
                 loss_total, loss_dict = loss_builder(outputs, batch)
+            if not bool(torch.isfinite(loss_total).item()):
+                if rank == 0:
+                    payload = {
+                        "step": step,
+                        "reason": "nonfinite_loss",
+                        "scene_id": batch["scene_id"],
+                        "clip_id": batch["clip_id"],
+                        "loss_total": str(loss_total.detach().item()),
+                        "bad_losses": {
+                            key: str(value.detach().item())
+                            for key, value in loss_dict.items()
+                            if not bool(torch.isfinite(value.detach()).item())
+                        },
+                        "batch_nonfinite": _collect_nonfinite_tensors(batch, prefix="batch"),
+                        "output_nonfinite": _collect_nonfinite_tensors(outputs, prefix="outputs"),
+                    }
+                    print(json.dumps(payload, ensure_ascii=False), flush=True)
+                    append_jsonl(log_dir / "nonfinite_steps.jsonl", payload)
+                skipped_nonfinite_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+                continue
             loss_total.backward()
-            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), runtime["grad_clip"])
+            bad_grads = _collect_nonfinite_gradients(raw_model)
+            if bad_grads:
+                if rank == 0:
+                    payload = {
+                        "step": step,
+                        "reason": "nonfinite_grad",
+                        "scene_id": batch["scene_id"],
+                        "clip_id": batch["clip_id"],
+                        "loss_total": float(loss_total.detach().item()),
+                        "bad_grads": bad_grads,
+                    }
+                    print(json.dumps(payload, ensure_ascii=False), flush=True)
+                    append_jsonl(log_dir / "nonfinite_steps.jsonl", payload)
+                skipped_nonfinite_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), runtime["grad_clip"])
+            if not math.isfinite(float(grad_norm)):
+                if rank == 0:
+                    payload = {
+                        "step": step,
+                        "reason": "nonfinite_grad_norm",
+                        "scene_id": batch["scene_id"],
+                        "clip_id": batch["clip_id"],
+                        "loss_total": float(loss_total.detach().item()),
+                        "grad_norm": str(float(grad_norm)),
+                    }
+                    print(json.dumps(payload, ensure_ascii=False), flush=True)
+                    append_jsonl(log_dir / "nonfinite_steps.jsonl", payload)
+                skipped_nonfinite_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+                continue
             optimizer.step()
 
-            if rank == 0 and (step % runtime["log_interval"] == 0 or step == runtime["max_steps"] - 1):
-                record = {
+            if rank == 0:
+                last_train_record = {
                     "step": step,
                     "loss_total": float(loss_total.detach().item()),
                     "lr_base": optimizer.param_groups[0]["lr"],
@@ -448,28 +691,113 @@ def main() -> None:
                     "clip_id": batch["clip_id"],
                     "loss_weights": loss_builder.weights.to_dict(),
                 }
-                record.update({f"loss_{key}": float(value.detach().item()) for key, value in loss_dict.items()})
-                print(json.dumps(record, ensure_ascii=False))
-                with (log_dir / "train_metrics.jsonl").open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                last_train_record.update({f"loss_{key}": float(value.detach().item()) for key, value in loss_dict.items()})
+                last_train_record.update(
+                    {key: float(value.detach().item()) for key, value in collect_debug_metrics(outputs).items()}
+                )
+                last_train_record["skipped_nonfinite_steps"] = skipped_nonfinite_steps
+                if step % runtime["log_interval"] == 0 or step == runtime["max_steps"] - 1:
+                    print(json.dumps(last_train_record, ensure_ascii=False), flush=True)
+                    append_jsonl(log_dir / "train_metrics.jsonl", last_train_record)
+                    write_status_json(
+                        log_dir / "run_status.json",
+                        {
+                            "state": "running",
+                            "hostname": socket.gethostname(),
+                            "pid": os.getpid(),
+                            "start_time": run_start_time,
+                            "last_step": step,
+                            "last_val_step": last_val_record["step"] if last_val_record is not None else None,
+                            "heartbeat_time": time.time(),
+                        },
+                    )
+
+            if rank == 0 and runtime["visualize_every_epochs"] > 0:
+                visualize_stride = runtime["visualize_every_epochs"] * epoch_size
+                should_visualize = ((step + 1) % visualize_stride == 0) or (step == runtime["max_steps"] - 1)
+                if should_visualize:
+                    epoch = (step + 1) // epoch_size
+                    vis_path = log_dir / "visuals" / f"epoch_{epoch:04d}_step_{step + 1:06d}.png"
+                    save_training_visualization(
+                        batch,
+                        outputs,
+                        model_cfg,
+                        vis_path,
+                        step=step,
+                        epoch=epoch,
+                        sample_idx=runtime["visualize_sample_index"],
+                        frame_idx=runtime["visualize_frame_index"],
+                        view_idx=runtime["visualize_view_index"],
+                        max_scene_points=runtime["visualize_max_scene_points"],
+                    )
 
             if rank == 0 and runtime["save_interval"] > 0 and (step + 1) % runtime["save_interval"] == 0:
                 save_checkpoint(log_dir / f"step_{step + 1:06d}.pt", step, raw_model, optimizer)
+                save_checkpoint(log_dir / "last.pt", step, raw_model, optimizer, score=best_score)
 
             if val_loader is not None and runtime["val_interval"] > 0 and (step + 1) % runtime["val_interval"] == 0:
                 val_metrics = evaluate(model, loss_builder, val_loader, device, ddp_enabled, runtime["val_batches"])
                 if rank == 0:
                     val_metrics["step"] = step
-                    print(json.dumps(val_metrics, ensure_ascii=False))
-                    with (log_dir / "val_metrics.jsonl").open("a", encoding="utf-8") as f:
-                        f.write(json.dumps(val_metrics, ensure_ascii=False) + "\n")
+                    last_val_record = dict(val_metrics)
+                    print(json.dumps(val_metrics, ensure_ascii=False), flush=True)
+                    append_jsonl(log_dir / "val_metrics.jsonl", val_metrics)
                     score = val_metrics["val_occ_iou"] + val_metrics["val_dyn_mask_iou"]
                     if best_score is None or score > best_score:
                         best_score = score
                         save_checkpoint(log_dir / "best.pt", step, raw_model, optimizer, score=score)
+                    save_checkpoint(log_dir / "last.pt", step, raw_model, optimizer, score=best_score)
+                    write_status_json(
+                        log_dir / "run_status.json",
+                        {
+                            "state": "running",
+                            "hostname": socket.gethostname(),
+                            "pid": os.getpid(),
+                            "start_time": run_start_time,
+                            "last_step": step,
+                            "last_val_step": step,
+                            "heartbeat_time": time.time(),
+                            "best_score": best_score,
+                        },
+                    )
 
         if rank == 0:
+            if last_train_record is not None and not (log_dir / "train_metrics.jsonl").exists():
+                append_jsonl(log_dir / "train_metrics.jsonl", last_train_record)
+            if last_val_record is not None and not (log_dir / "val_metrics.jsonl").exists():
+                append_jsonl(log_dir / "val_metrics.jsonl", last_val_record)
             save_checkpoint(log_dir / "last.pt", runtime["max_steps"] - 1, raw_model, optimizer, score=best_score)
+            write_status_json(
+                log_dir / "run_status.json",
+                {
+                    "state": "finished",
+                    "hostname": socket.gethostname(),
+                    "pid": os.getpid(),
+                    "start_time": run_start_time,
+                    "finish_time": time.time(),
+                    "last_step": runtime["max_steps"] - 1,
+                    "last_val_step": last_val_record["step"] if last_val_record is not None else None,
+                    "best_score": best_score,
+                },
+            )
+    except BaseException as exc:
+        run_exception = exc
+        if rank == 0 and "log_dir" in locals():
+            write_status_json(
+                log_dir / "run_status.json",
+                {
+                    "state": "failed",
+                    "hostname": socket.gethostname(),
+                    "pid": os.getpid(),
+                    "start_time": run_start_time,
+                    "fail_time": time.time(),
+                    "last_step": last_train_record["step"] if "last_train_record" in locals() and last_train_record is not None else None,
+                    "last_val_step": last_val_record["step"] if "last_val_record" in locals() and last_val_record is not None else None,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+        raise
     finally:
         cleanup_distributed(ddp_enabled)
 
