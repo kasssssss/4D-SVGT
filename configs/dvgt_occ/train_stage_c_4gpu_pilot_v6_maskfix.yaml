@@ -1,12 +1,22 @@
 data:
   manifest: data/nuscenes_dvgt_v0/manifest_trainval.json
   output_root: data/nuscenes_dvgt_v0
+  require_supervision_frozen: true
+  supervision_ready_files:
+    - data/nuscenes_dvgt_v0/logs/dev_backfill_full_20260419/sam3_backfill_full.status
+    - data/nuscenes_dvgt_v0/logs/dev_backfill_full_20260419/postprocess_after_backfill.status
+    - data/nuscenes_dvgt_v0/logs/dev_backfill_full_20260419/audit_after_backfill.json
+    - data/nuscenes_dvgt_v0/qc/sam3_mask_consistency_backfill_full/summary.json
   train_scene_ids: ["000", "001", "002", "003", "005", "006", "007", "008"]
   val_scene_ids: ["004", "009"]
   train_limit: null
   val_limit: null
   val_dynamic_only: true
   val_min_dynamic_pixels: 256
+  dynamic_val_scene_ids: ["004", "009"]
+  dynamic_val_limit: null
+  dynamic_val_only: true
+  dynamic_val_min_dynamic_pixels: 1024
 
 model:
   num_frames: 8
@@ -35,12 +45,14 @@ train:
   save_interval: 40
   val_interval: 40
   val_batches: 16
+  dynamic_val_batches: 16
   amp: true
   gradient_checkpointing: true
   grad_clip: 1.0
   warmup_iters: 1500
   min_lr: 1.0e-6
-  stability_start_step: 1000000
+  bridge_start_step: 1500
+  stability_start_step: 4000
   allow_tf32: true
   log_dir: data/nuscenes_dvgt_v0/logs/train_stage_c_4gpu_pilot_v6_maskfix
   resume: null
@@ -85,6 +97,12 @@ loss_weights:
     occ_local2gs: 0.0
     gs2occ_local: 0.0
     sem_proj_2d: 0.0
+    motion_cons: 0.0
+    gs_sparse: 0.0
+  bridge_warmup:
+    occ_local2gs: 0.05
+    gs2occ_local: 0.05
+    sem_proj_2d: 0.10
     motion_cons: 0.0
     gs_sparse: 0.0
   after_stability:

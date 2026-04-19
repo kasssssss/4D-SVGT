@@ -42,6 +42,7 @@ from dvgt_occ.training import (
     binary_iou_from_logits,
     binary_stats_from_logits,
     collate_dvgt_occ_batch,
+    iou_threshold_sweep_from_logits,
     masked_l1,
     masked_psnr,
     move_batch_to_device,
@@ -51,6 +52,7 @@ from dvgt_occ.training import (
     soft_iou_from_logits,
     save_training_visualization,
     stage_b_after_stability_weights,
+    stage_c_bridge_warmup_weights,
 )
 
 
@@ -125,6 +127,7 @@ def build_runtime_config(args: argparse.Namespace, cfg: Dict[str, object]) -> Di
     data_cfg = dict(cfg.get("data", {}))
     train_cfg = dict(cfg.get("train", {}))
     ddp_cfg = dict(cfg.get("ddp", {}))
+    ready_files = [Path(path) for path in data_cfg.get("supervision_ready_files", [])]
     runtime = {
         "manifest": Path(args.manifest or data_cfg.get("manifest", "data/nuscenes_dvgt_v0/manifest_trainval.json")),
         "output_root": Path(args.output_root or data_cfg.get("output_root", "data/nuscenes_dvgt_v0")),
@@ -142,11 +145,19 @@ def build_runtime_config(args: argparse.Namespace, cfg: Dict[str, object]) -> Di
         "val_batches": int(args.val_batches if args.val_batches is not None else train_cfg.get("val_batches", 32)),
         "val_dynamic_only": bool(data_cfg.get("val_dynamic_only", False)),
         "val_min_dynamic_pixels": int(data_cfg.get("val_min_dynamic_pixels", 32)),
+        "dynamic_val_scene_ids": data_cfg.get("dynamic_val_scene_ids"),
+        "dynamic_val_limit": data_cfg.get("dynamic_val_limit"),
+        "dynamic_val_only": bool(data_cfg.get("dynamic_val_only", bool(data_cfg.get("dynamic_val_scene_ids")))),
+        "dynamic_val_min_dynamic_pixels": int(data_cfg.get("dynamic_val_min_dynamic_pixels", data_cfg.get("val_min_dynamic_pixels", 32))),
+        "dynamic_val_batches": int(train_cfg.get("dynamic_val_batches", args.val_batches if args.val_batches is not None else train_cfg.get("val_batches", 32))),
         "grad_clip": float(train_cfg.get("grad_clip", 1.0)),
         "amp": bool(train_cfg.get("amp", True)),
         "gradient_checkpointing": bool(train_cfg.get("gradient_checkpointing", False)),
         "warmup_iters": int(train_cfg.get("warmup_iters", 1500)),
         "min_lr": float(train_cfg.get("min_lr", 1e-6)),
+        "require_supervision_frozen": bool(data_cfg.get("require_supervision_frozen", False)),
+        "supervision_ready_files": ready_files,
+        "bridge_start_step": int(train_cfg.get("bridge_start_step", train_cfg.get("stability_start_step", 0))),
         "stability_start_step": int(train_cfg.get("stability_start_step", 0)),
         "allow_tf32": bool(train_cfg.get("allow_tf32", True)),
         "log_dir": Path(args.log_dir or train_cfg.get("log_dir", "data/nuscenes_dvgt_v0/logs/train_stage")),
@@ -236,11 +247,18 @@ def adjust_learning_rate(optimizer: torch.optim.Optimizer, step: int, max_steps:
         group["lr"] = lr
 
 
-def build_loss_weights(cfg: Dict[str, object]) -> tuple[LossWeights, LossWeights]:
+def build_loss_weights(cfg: Dict[str, object]) -> tuple[LossWeights, LossWeights, LossWeights]:
     weights_cfg = dict(cfg.get("loss_weights", {}))
     merged = DEFAULT_STAGE_B_SCAFFOLD_WEIGHTS.to_dict()
     merged.update(weights_cfg.get("base", weights_cfg))
     base = LossWeights(**merged)
+
+    bridge_cfg = weights_cfg.get("bridge_warmup")
+    bridge = stage_c_bridge_warmup_weights()
+    if bridge_cfg:
+        bridge_merged = bridge.to_dict()
+        bridge_merged.update(bridge_cfg)
+        bridge = LossWeights(**bridge_merged)
 
     after_cfg = weights_cfg.get("after_stability")
     after = stage_b_after_stability_weights()
@@ -248,7 +266,7 @@ def build_loss_weights(cfg: Dict[str, object]) -> tuple[LossWeights, LossWeights
         after_merged = after.to_dict()
         after_merged.update(after_cfg)
         after = LossWeights(**after_merged)
-    return base, after
+    return base, bridge, after
 
 
 def discover_scene_splits(manifest_path: Path, train_scene_ids: Sequence[str] | None, val_scene_ids: Sequence[str] | None) -> tuple[List[str] | None, List[str] | None]:
@@ -392,6 +410,25 @@ def write_status_json(path: Path, payload: Dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def to_jsonable(obj: object) -> object:
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(key): to_jsonable(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(value) for value in obj]
+    return obj
+
+
+def validate_supervision_contract(runtime: Dict[str, object]) -> None:
+    if not runtime["require_supervision_frozen"]:
+        return
+    missing = [str(path) for path in runtime["supervision_ready_files"] if not Path(path).exists()]
+    if missing:
+        joined = "\n".join(missing)
+        raise RuntimeError(f"Supervision freeze contract not satisfied. Missing required files:\n{joined}")
+
+
 def save_checkpoint(path: Path, step: int, raw_model: torch.nn.Module, optimizer: torch.optim.Optimizer, score: float | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"step": step, "model": raw_model.state_dict(), "optimizer": optimizer.state_dict()}
@@ -401,13 +438,26 @@ def save_checkpoint(path: Path, step: int, raw_model: torch.nn.Module, optimizer
 
 
 def collect_debug_metrics(outputs: Dict[str, object]) -> Dict[str, torch.Tensor]:
+    return collect_debug_metrics_with_batch(outputs, None)
+
+
+def collect_debug_metrics_with_batch(outputs: Dict[str, object], batch: Dict[str, torch.Tensor] | None) -> Dict[str, torch.Tensor]:
     metrics: Dict[str, torch.Tensor] = {}
     assignment = outputs.get("assignment")
     if assignment is not None:
         metrics["debug_assign_bg_mean"] = assignment.background_prob.mean()
+        metrics["debug_assign_bg_gt_05_ratio"] = (assignment.background_prob > 0.5).float().mean()
         metrics["debug_assign_fg_max_mean"] = assignment.assignment_prob[..., 1:].max(dim=-1).values.mean()
         metrics["debug_assign_pos_ratio"] = (assignment.assigned_query >= 0).float().mean()
         metrics["debug_assign_gate_active"] = (assignment.local_gate > 0.5).float().mean()
+        metrics["debug_assign_unique_query_mean"] = torch.stack(
+            [
+                assignment.assigned_query[batch_idx][assignment.assigned_query[batch_idx] >= 0].unique().numel()
+                if bool((assignment.assigned_query[batch_idx] >= 0).any().item())
+                else assignment.assigned_query.new_tensor(0)
+                for batch_idx in range(assignment.assigned_query.shape[0])
+            ]
+        ).float().mean()
         if assignment.feature_similarity is not None:
             metrics["debug_assign_feat_sim_mean"] = assignment.feature_similarity.mean()
         if assignment.routing_keep_score is not None:
@@ -416,8 +466,18 @@ def collect_debug_metrics(outputs: Dict[str, object]) -> Dict[str, torch.Tensor]
     gaussians = outputs.get("gaussians")
     if gaussians is not None:
         metrics["debug_gauss_keep_mean"] = gaussians.keep_score.mean()
+        metrics["debug_gauss_keep_gt_01_ratio"] = (gaussians.keep_score > 0.1).float().mean()
+        metrics["debug_gauss_keep_gt_05_ratio"] = (gaussians.keep_score > 0.5).float().mean()
+        metrics["debug_gauss_effective_count_bt_mean"] = (gaussians.keep_score > 0.1).float().reshape(gaussians.keep_score.shape[0], gaussians.keep_score.shape[1], -1).sum(dim=-1).mean()
         metrics["debug_gauss_opacity_mean"] = gaussians.opacity.mean()
         metrics["debug_gauss_scale_mean"] = gaussians.scale.mean()
+        if batch is not None and "gs_global_track_id_1_8" in batch:
+            supervised = (batch["gs_global_track_id_1_8"] >= 0).float()
+            keep = (gaussians.keep_score.squeeze(-1) > 0.1).float()
+            supervised_denom = supervised.sum().clamp_min(1.0)
+            metrics["debug_gauss_supervised_ratio"] = supervised.mean()
+            metrics["debug_gauss_supervised_kept_ratio"] = (keep * supervised).sum() / supervised_denom
+            metrics["debug_global_weak_valid_ratio"] = supervised.mean()
 
     render = outputs.get("render")
     if render is not None:
@@ -438,6 +498,7 @@ def evaluate(
     device: torch.device,
     ddp_enabled: bool,
     max_batches: int,
+    prefix: str = "val",
 ) -> Dict[str, float]:
     model.eval()
     loss_totals: Dict[str, torch.Tensor] = {}
@@ -458,21 +519,25 @@ def evaluate(
             dyn_valid = dyn_valid.unsqueeze(3)
         render_valid = render_valid_mask_from_points_conf(batch["points_conf"])
         metrics = {
-            "val_loss_total": loss_total.detach(),
-            "val_occ_iou": binary_iou_from_logits(occ_logits, occ_target),
-            "val_occ_soft_iou": soft_iou_from_logits(occ_logits, occ_target),
-            "val_dyn_mask_iou": binary_iou_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid),
-            "val_render_l1": masked_l1(outputs["render"].render_rgb_all, batch["rgb_target"], render_valid),
-            "val_render_psnr": masked_psnr(outputs["render"].render_rgb_all, batch["rgb_target"], render_valid),
+            f"{prefix}_loss_total": loss_total.detach(),
+            f"{prefix}_occ_iou": binary_iou_from_logits(occ_logits, occ_target),
+            f"{prefix}_occ_soft_iou": soft_iou_from_logits(occ_logits, occ_target),
+            f"{prefix}_dyn_mask_iou": binary_iou_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid),
+            f"{prefix}_render_l1": masked_l1(outputs["render"].render_rgb_all, batch["rgb_target"], render_valid),
+            f"{prefix}_render_psnr": masked_psnr(outputs["render"].render_rgb_all, batch["rgb_target"], render_valid),
         }
         for key, value in binary_stats_from_logits(occ_logits, occ_target).items():
-            metrics[f"val_occ_{key}"] = value
+            metrics[f"{prefix}_occ_{key}"] = value
+        for key, value in iou_threshold_sweep_from_logits(occ_logits, occ_target).items():
+            metrics[f"{prefix}_occ_{key}"] = value
         for key, value in binary_stats_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid).items():
-            metrics[f"val_dyn_mask_{key}"] = value
+            metrics[f"{prefix}_dyn_mask_{key}"] = value
+        for key, value in iou_threshold_sweep_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid).items():
+            metrics[f"{prefix}_dyn_mask_{key}"] = value
         for key, value in loss_dict.items():
-            metrics[f"val_loss_{key}"] = value.detach()
-        for key, value in collect_debug_metrics(outputs).items():
-            metrics[f"val_{key}"] = value.detach()
+            metrics[f"{prefix}_loss_{key}"] = value.detach()
+        for key, value in collect_debug_metrics_with_batch(outputs, batch).items():
+            metrics[f"{prefix}_{key}"] = value.detach()
         for key, value in metrics.items():
             loss_totals[key] = loss_totals.get(key, torch.zeros_like(value)) + value
         denom += 1
@@ -501,11 +566,24 @@ def main() -> None:
             torch.backends.cuda.matmul.allow_tf32 = runtime["allow_tf32"]
             torch.backends.cudnn.allow_tf32 = runtime["allow_tf32"]
 
+        validate_supervision_contract(runtime)
+
         train_scene_ids, val_scene_ids = discover_scene_splits(runtime["manifest"], runtime["train_scene_ids"], runtime["val_scene_ids"])
         train_dataset = build_dataset(runtime["manifest"], runtime["output_root"], model_cfg, train_scene_ids, runtime["train_limit"])
         val_dataset = build_dataset(runtime["manifest"], runtime["output_root"], model_cfg, val_scene_ids, runtime["val_limit"]) if val_scene_ids else None
         if val_dataset is not None and runtime["val_dynamic_only"]:
             val_dataset = select_dynamic_subset(val_dataset, runtime["val_min_dynamic_pixels"])
+        dynamic_val_scene_ids = runtime["dynamic_val_scene_ids"]
+        dynamic_val_dataset = None
+        if runtime["dynamic_val_only"] and (dynamic_val_scene_ids is not None or val_scene_ids is not None):
+            dynamic_val_dataset = build_dataset(
+                runtime["manifest"],
+                runtime["output_root"],
+                model_cfg,
+                dynamic_val_scene_ids if dynamic_val_scene_ids is not None else val_scene_ids,
+                runtime["dynamic_val_limit"],
+            )
+            dynamic_val_dataset = select_dynamic_subset(dynamic_val_dataset, runtime["dynamic_val_min_dynamic_pixels"])
         if len(train_dataset) == 0:
             raise RuntimeError("No training clips selected.")
 
@@ -516,6 +594,11 @@ def main() -> None:
         if val_dataset is not None and len(val_dataset) > 0:
             val_loader, _ = build_loader(
                 val_dataset, runtime["batch_size"], runtime["num_workers"], ddp_enabled, rank, world_size, shuffle=False
+            )
+        dynamic_val_loader = None
+        if dynamic_val_dataset is not None and len(dynamic_val_dataset) > 0:
+            dynamic_val_loader, _ = build_loader(
+                dynamic_val_dataset, runtime["batch_size"], runtime["num_workers"], ddp_enabled, rank, world_size, shuffle=False
             )
 
         model = DVGTOccModel(config=model_cfg).to(device)
@@ -532,7 +615,7 @@ def main() -> None:
             )
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
 
-        base_weights, after_weights = build_loss_weights(cfg)
+        base_weights, bridge_weights, after_weights = build_loss_weights(cfg)
         loss_builder = DVGTOccLossBuilder(config=model_cfg, weights=base_weights).to(device)
         optimizer = build_optimizer(raw_model, cfg)
         autocast_enabled = bool(runtime["amp"] and device.type == "cuda")
@@ -548,13 +631,17 @@ def main() -> None:
         if rank == 0:
             log_dir.mkdir(parents=True, exist_ok=True)
             snapshot = {
-                "runtime": {key: str(value) if isinstance(value, Path) else value for key, value in runtime.items()},
+                "runtime": to_jsonable(runtime),
                 "model": asdict(model_cfg),
                 "train_scene_ids": train_scene_ids,
                 "val_scene_ids": val_scene_ids,
                 "val_dynamic_only": runtime["val_dynamic_only"],
                 "val_min_dynamic_pixels": runtime["val_min_dynamic_pixels"],
+                "dynamic_val_scene_ids": dynamic_val_scene_ids if dynamic_val_scene_ids is not None else val_scene_ids,
+                "dynamic_val_only": runtime["dynamic_val_only"],
+                "dynamic_val_min_dynamic_pixels": runtime["dynamic_val_min_dynamic_pixels"],
                 "base_loss_weights": base_weights.to_dict(),
+                "bridge_warmup_loss_weights": bridge_weights.to_dict(),
                 "after_stability_loss_weights": after_weights.to_dict(),
                 "ddp": {
                     "enabled": ddp_enabled,
@@ -617,7 +704,9 @@ def main() -> None:
             loss_builder.weights = resolve_loss_weights(
                 step=step,
                 base=base_weights,
+                bridge_warmup=bridge_weights,
                 after_stability=after_weights,
+                bridge_start_step=runtime["bridge_start_step"],
                 stability_start_step=runtime["stability_start_step"],
             )
             adjust_learning_rate(optimizer, step, runtime["max_steps"], runtime["warmup_iters"], runtime["min_lr"])
@@ -690,10 +779,15 @@ def main() -> None:
                     "scene_id": batch["scene_id"],
                     "clip_id": batch["clip_id"],
                     "loss_weights": loss_builder.weights.to_dict(),
+                    "curriculum_phase": (
+                        "base"
+                        if step < runtime["bridge_start_step"]
+                        else ("bridge_warmup" if step < runtime["stability_start_step"] else "joint_refine")
+                    ),
                 }
                 last_train_record.update({f"loss_{key}": float(value.detach().item()) for key, value in loss_dict.items()})
                 last_train_record.update(
-                    {key: float(value.detach().item()) for key, value in collect_debug_metrics(outputs).items()}
+                    {key: float(value.detach().item()) for key, value in collect_debug_metrics_with_batch(outputs, batch).items()}
                 )
                 last_train_record["skipped_nonfinite_steps"] = skipped_nonfinite_steps
                 if step % runtime["log_interval"] == 0 or step == runtime["max_steps"] - 1:
@@ -735,14 +829,28 @@ def main() -> None:
                 save_checkpoint(log_dir / f"step_{step + 1:06d}.pt", step, raw_model, optimizer)
                 save_checkpoint(log_dir / "last.pt", step, raw_model, optimizer, score=best_score)
 
-            if val_loader is not None and runtime["val_interval"] > 0 and (step + 1) % runtime["val_interval"] == 0:
-                val_metrics = evaluate(model, loss_builder, val_loader, device, ddp_enabled, runtime["val_batches"])
+            if (val_loader is not None or dynamic_val_loader is not None) and runtime["val_interval"] > 0 and (step + 1) % runtime["val_interval"] == 0:
+                val_metrics: Dict[str, float] = {}
+                if val_loader is not None:
+                    val_metrics.update(evaluate(model, loss_builder, val_loader, device, ddp_enabled, runtime["val_batches"], prefix="val"))
+                if dynamic_val_loader is not None:
+                    val_metrics.update(
+                        evaluate(
+                            model,
+                            loss_builder,
+                            dynamic_val_loader,
+                            device,
+                            ddp_enabled,
+                            runtime["dynamic_val_batches"],
+                            prefix="dynheavy_val",
+                        )
+                    )
                 if rank == 0:
                     val_metrics["step"] = step
                     last_val_record = dict(val_metrics)
                     print(json.dumps(val_metrics, ensure_ascii=False), flush=True)
                     append_jsonl(log_dir / "val_metrics.jsonl", val_metrics)
-                    score = val_metrics["val_occ_iou"] + val_metrics["val_dyn_mask_iou"]
+                    score = val_metrics.get("val_occ_iou", 0.0) + val_metrics.get("val_dyn_mask_iou", 0.0)
                     if best_score is None or score > best_score:
                         best_score = score
                         save_checkpoint(log_dir / "best.pt", step, raw_model, optimizer, score=score)

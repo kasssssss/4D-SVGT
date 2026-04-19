@@ -10,6 +10,7 @@ from .loss_builder import DVGTOccLossBuilder
 from .metrics import (
     binary_iou_from_logits,
     binary_stats_from_logits,
+    iou_threshold_sweep_from_logits,
     masked_l1,
     masked_psnr,
     reduce_metrics,
@@ -21,6 +22,7 @@ from .stage_scheduler import (
     LossWeights,
     resolve_loss_weights,
     stage_b_after_stability_weights,
+    stage_c_bridge_warmup_weights,
 )
 from .visualization import save_training_visualization
 
@@ -32,8 +34,10 @@ __all__ = [
     "LossWeights",
     "resolve_loss_weights",
     "stage_b_after_stability_weights",
+    "stage_c_bridge_warmup_weights",
     "binary_iou_from_logits",
     "binary_stats_from_logits",
+    "iou_threshold_sweep_from_logits",
     "soft_iou_from_logits",
     "masked_l1",
     "masked_psnr",

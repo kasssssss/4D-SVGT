@@ -37,6 +37,16 @@ class LossWeights:
 DEFAULT_STAGE_B_SCAFFOLD_WEIGHTS = LossWeights()
 
 
+def stage_c_bridge_warmup_weights() -> LossWeights:
+    return LossWeights(
+        occ_local2gs=0.05,
+        gs2occ_local=0.05,
+        sem_proj_2d=0.10,
+        motion_cons=0.0,
+        gs_sparse=0.0,
+    )
+
+
 def stage_b_after_stability_weights() -> LossWeights:
     return LossWeights(
         occ_local2gs=0.1,
@@ -57,9 +67,15 @@ def merge_loss_weights(base: LossWeights, override: LossWeights) -> LossWeights:
 def resolve_loss_weights(
     step: int,
     base: LossWeights = DEFAULT_STAGE_B_SCAFFOLD_WEIGHTS,
+    bridge_warmup: LossWeights | None = None,
     after_stability: LossWeights | None = None,
+    bridge_start_step: int | None = None,
     stability_start_step: int | None = None,
 ) -> LossWeights:
+    if bridge_warmup is not None and bridge_start_step is not None and step >= int(bridge_start_step):
+        if after_stability is not None and stability_start_step is not None and step >= int(stability_start_step):
+            return merge_loss_weights(base, after_stability)
+        return merge_loss_weights(base, bridge_warmup)
     if after_stability is None or stability_start_step is None:
         return base
     if step < int(stability_start_step):

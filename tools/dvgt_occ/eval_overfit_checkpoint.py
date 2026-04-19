@@ -88,7 +88,10 @@ def main() -> None:
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate_dvgt_occ_batch)
 
     model = DVGTOccModel(config=model_cfg).to(device)
-    loss_builder = DVGTOccLossBuilder(config=model_cfg, weights=build_loss_weights(cfg)).to(device)
+    base_weights = build_loss_weights(cfg)
+    if isinstance(base_weights, tuple):
+        base_weights = base_weights[0]
+    loss_builder = DVGTOccLossBuilder(config=model_cfg, weights=base_weights).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()

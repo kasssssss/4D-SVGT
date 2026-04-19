@@ -14,7 +14,8 @@ class GaussianMaskRenderer(nn.Module):
     def __init__(self, output_size: tuple[int, int] = (224, 448), splat_radius: int = 2) -> None:
         super().__init__()
         self.output_size = output_size
-        self.splat_radius = int(splat_radius)
+        self.splat_radius = max(int(splat_radius), 1)
+        self.radius_scale = 1.5
         offsets = list(itertools.product(range(-self.splat_radius, self.splat_radius + 1), repeat=2))
         self.register_buffer('kernel_offsets', torch.tensor(offsets, dtype=torch.long), persistent=False)
 
@@ -96,7 +97,7 @@ class GaussianMaskRenderer(nn.Module):
         view_count = torch.zeros((), device=device, dtype=centers.dtype)
 
         centers_flat = centers.reshape(b, t, -1, 3)
-        scales_flat = scales.max(dim=-1).values.reshape(b, t, -1)
+        scales_flat = scales.mean(dim=-1).reshape(b, t, -1)
         colors_flat = colors.reshape(b, t, -1, 3).clamp(0.0, 1.0)
         alpha_flat = alpha.reshape(b, t, -1).clamp(0.0, 1.0)
 
@@ -165,7 +166,7 @@ class GaussianMaskRenderer(nn.Module):
 
         u = cam[:, 0] * fx / z + cx
         v = cam[:, 1] * fy / z + cy
-        sigma = (((fx + fy) * 0.5) * scale.abs() / z.clamp_min(1e-3)).clamp(1.5, 10.0)
+        sigma = (((fx + fy) * 0.5) * scale.abs() / z.clamp_min(1e-3)).clamp(0.75, 10.0)
         valid = (u >= -self.splat_radius - 1.0) & (u <= width + self.splat_radius) & (v >= -self.splat_radius - 1.0) & (v <= height + self.splat_radius)
         if not torch.any(valid):
             zero = torch.zeros((), device=device, dtype=out_dtype)
@@ -176,30 +177,43 @@ class GaussianMaskRenderer(nn.Module):
         sigma = sigma[valid]
         color = color[valid]
         alpha = alpha[valid]
+        z = z[valid]
         sigma_mean = sigma.mean().to(out_dtype)
+
+        order = torch.argsort(z, descending=False)
+        u = u[order]
+        v = v[order]
+        sigma = sigma[order]
+        color = color[order]
+        alpha = alpha[order]
 
         x0 = torch.floor(u).long()
         y0 = torch.floor(v).long()
         offsets = self.kernel_offsets.to(device=device)
-        xo = x0[:, None] + offsets[None, :, 0]
-        yo = y0[:, None] + offsets[None, :, 1]
-        keep = (xo >= 0) & (xo < width) & (yo >= 0) & (yo < height)
-        if not torch.any(keep):
-            zero = torch.zeros((), device=device, dtype=out_dtype)
-            return rgb_num.reshape(3, height, width).to(out_dtype), alpha_den.reshape(height, width).to(out_dtype), sigma_mean, zero
+        radii = torch.ceil(sigma * self.radius_scale).long().clamp(min=1, max=self.splat_radius)
+        for point_idx in range(u.shape[0]):
+            radius = int(radii[point_idx].item())
+            point_offsets = offsets[
+                (offsets[:, 0].abs() <= radius) & (offsets[:, 1].abs() <= radius)
+            ]
+            xo = x0[point_idx] + point_offsets[:, 0]
+            yo = y0[point_idx] + point_offsets[:, 1]
+            keep = (xo >= 0) & (xo < width) & (yo >= 0) & (yo < height)
+            if not torch.any(keep):
+                continue
+            xo = xo[keep]
+            yo = yo[keep]
+            du = (u[point_idx] - xo.float()) / sigma[point_idx].clamp_min(1e-3)
+            dv = (v[point_idx] - yo.float()) / sigma[point_idx].clamp_min(1e-3)
+            local_alpha = torch.exp(-0.5 * (du * du + dv * dv)) * alpha[point_idx]
+            local_alpha = local_alpha.clamp(0.0, 0.999)
+            idx = yo * width + xo
+            transmittance = (1.0 - alpha_den[idx]).clamp(0.0, 1.0)
+            contrib = local_alpha * transmittance
+            alpha_den[idx] = (alpha_den[idx] + contrib).clamp(0.0, 0.999)
+            rgb_num[:, idx] = rgb_num[:, idx] + color[point_idx].unsqueeze(-1) * contrib.unsqueeze(0)
 
-        du = (u[:, None] - xo.float()) / sigma[:, None]
-        dv = (v[:, None] - yo.float()) / sigma[:, None]
-        weight = torch.exp(-0.5 * (du * du + dv * dv)) * alpha[:, None]
-        weight = weight * keep.float()
-        idx = (yo * width + xo).clamp_min(0)
-        idx = idx[keep]
-        weight_flat = weight[keep]
-        color_flat = color[:, None, :].expand(-1, offsets.shape[0], -1)[keep]
-        alpha_den.scatter_add_(0, idx, weight_flat)
-        rgb_num.scatter_add_(1, idx.unsqueeze(0).expand(3, -1), (color_flat * weight_flat.unsqueeze(-1)).t())
-
-        rgb = rgb_num / alpha_den.clamp_min(1e-6).unsqueeze(0)
+        rgb = rgb_num
         touch_ratio = (alpha_den > 1e-6).float().mean().to(out_dtype)
         return (
             rgb.reshape(3, height, width).clamp(0.0, 1.0).to(out_dtype),
