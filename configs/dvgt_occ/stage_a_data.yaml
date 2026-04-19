@@ -40,6 +40,9 @@ supervision:
       - pedestrian
       - bicycle
       - motorcycle
+      - cyclist
+      - bicyclist
+      - motorcyclist
   required_files:
     - dyn_soft_mask_1_4.npy
     - gs_local_inst_id_1_8.npy

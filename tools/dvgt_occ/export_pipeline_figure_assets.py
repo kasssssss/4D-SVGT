@@ -35,6 +35,7 @@ SEMANTIC_PALETTE = np.array(
         [30, 144, 255],
         [50, 205, 50],
         [148, 0, 211],
+        [0, 206, 209],
     ],
     dtype=np.float32,
 ) / 255.0
@@ -302,6 +303,8 @@ def _class_to_semantic_idx(class_name: str) -> int:
         return 4
     if "pedestrian" in name:
         return 5
+    if "cyclist" in name or "bicyclist" in name or "motorcyclist" in name or "rider" in name:
+        return 8
     if "bicycle" in name or name == "bike":
         return 6
     if "motorcycle" in name or "motorbike" in name:

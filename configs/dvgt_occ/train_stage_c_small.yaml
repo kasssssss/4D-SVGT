@@ -17,7 +17,7 @@ model:
   motion_dim: 16
   dynamic_classes: 8
   semantic_classes: 18
-  projected_semantic_classes: 8
+  projected_semantic_classes: 9
   max_track_queries: 64
   new_queries: 64
 

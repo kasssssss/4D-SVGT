@@ -58,7 +58,7 @@ def _load_scene_records(scene_dir: Path, view_ids: Iterable[int]) -> Dict[int, D
 
 
 def _fallback_dynamic_score(record: dict) -> float:
-    if record["class_name"] in {"pedestrian", "bicycle", "motorcycle"}:
+    if record["class_name"] in {"pedestrian", "bicycle", "motorcycle", "cyclist", "bicyclist", "motorcyclist", "rider"}:
         return 0.8
     return 0.5
 

@@ -78,6 +78,7 @@ def main() -> None:
         root=runtime["output_root"],
         load_cache=True,
         load_supervision=True,
+        projected_semantic_classes=model_cfg.projected_semantic_classes,
         cache_keys=DEFAULT_CACHE_KEYS,
         supervision_keys=DEFAULT_SUPERVISION_KEYS,
         scene_ids=runtime["scene_ids"],

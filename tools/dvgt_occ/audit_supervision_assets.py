@@ -14,6 +14,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from dvgt_occ.config import DEFAULT_DVGT_OCC_CONFIG
 from dvgt_occ.data import DVGTOccClipDataset
 from dvgt_occ.data.manifest import load_manifest, resolve_manifest_path
 from dvgt_occ.data.stage_a_utils import resize_mask_float
@@ -148,6 +149,7 @@ def main() -> None:
         load_cache=True,
         load_supervision=True,
         load_scene_sam3_full=False,
+        projected_semantic_classes=DEFAULT_DVGT_OCC_CONFIG.projected_semantic_classes,
     )
 
     summary: dict[str, Any] = {
@@ -201,6 +203,7 @@ def main() -> None:
         load_cache=True,
         load_supervision=True,
         load_scene_sam3_full=True,
+        projected_semantic_classes=DEFAULT_DVGT_OCC_CONFIG.projected_semantic_classes,
     )
     for idx in sample_indices:
         summary["sample_clips"].append(audit_clip_sample(sample_dataset[idx], idx))

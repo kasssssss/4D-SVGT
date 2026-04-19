@@ -11,6 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from dvgt_occ.config import DEFAULT_DVGT_OCC_CONFIG
 from dvgt_occ.data.dataset import DVGTOccClipDataset
 
 
@@ -81,6 +82,7 @@ def main() -> None:
         root=args.output_root or args.manifest.parent,
         load_cache=True,
         load_supervision=True,
+        projected_semantic_classes=DEFAULT_DVGT_OCC_CONFIG.projected_semantic_classes,
     )
     end = min(len(dataset), args.index + args.limit)
     for idx in range(args.index, end):

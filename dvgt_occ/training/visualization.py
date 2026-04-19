@@ -26,6 +26,7 @@ SEMANTIC_CLASS_NAMES = [
     "pedestrian",
     "bicycle",
     "motorcycle",
+    "cyclist",
 ]
 
 SEMANTIC_PALETTE = np.array(
@@ -38,6 +39,7 @@ SEMANTIC_PALETTE = np.array(
         [30, 144, 255],
         [50, 205, 50],
         [148, 0, 211],
+        [0, 206, 209],
     ],
     dtype=np.float32,
 ) / 255.0

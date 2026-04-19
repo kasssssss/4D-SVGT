@@ -45,6 +45,9 @@ DEFAULT_PROMPTS = (
     "pedestrian",
     "bicycle",
     "motorcycle",
+    "cyclist",
+    "bicyclist",
+    "motorcyclist",
 )
 
 PROMPT_TO_CLASS = {
@@ -56,6 +59,9 @@ PROMPT_TO_CLASS = {
     "pedestrian": 5,
     "bicycle": 6,
     "motorcycle": 7,
+    "cyclist": 8,
+    "bicyclist": 8,
+    "motorcyclist": 8,
 }
 
 
@@ -124,7 +130,10 @@ def _install_sam3_import_shims() -> None:
                 return x
 
         def _trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
-            return torch.nn.init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
+            with torch.no_grad():
+                tensor.normal_(mean=mean, std=std)
+                tensor.clamp_(min=a, max=b)
+            return tensor
 
         for mod in (timm_layers_mod, timm_models_layers_mod):
             mod.DropPath = _DropPath
@@ -164,6 +173,16 @@ def _configure_runtime_cache(
     return temp_dir
 
 
+def _predictor_gpu_ids_from_env() -> list[int] | None:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return None
+    tokens = [token.strip() for token in visible.split(",") if token.strip()]
+    if not tokens:
+        return None
+    return list(range(len(tokens)))
+
+
 def _to_numpy(value) -> np.ndarray:
     try:
         import torch
@@ -175,21 +194,10 @@ def _to_numpy(value) -> np.ndarray:
     return np.asarray(value)
 
 
-def _start_and_propagate(predictor, video_dir: Path, prompt: str) -> Dict[int, dict]:
-    response = predictor.handle_request(request={"type": "start_session", "resource_path": str(video_dir)})
-    session_id = response["session_id"]
-    predictor.handle_request(
-        request={
-            "type": "add_prompt",
-            "session_id": session_id,
-            "frame_index": 0,
-            "text": prompt,
-        }
-    )
+def _propagate_session(predictor, session_id: str) -> Dict[int, dict]:
     outputs = {}
     for response in predictor.handle_stream_request(request={"type": "propagate_in_video", "session_id": session_id}):
         outputs[int(response["frame_index"])] = response.get("outputs", {})
-    predictor.handle_request(request={"type": "close_session", "session_id": session_id})
     return outputs
 
 
@@ -229,16 +237,112 @@ def _mask_box_fill_ratio(mask: np.ndarray) -> float:
 def _quality_flags(mask: np.ndarray, refined: bool = False) -> tuple[bool, bool, str]:
     if mask.sum() == 0:
         return False, False, "empty_mask"
-    box_like_flag = (_mask_box_fill_ratio(mask) > 0.92) and (not refined)
+    box_like_flag = _mask_box_fill_ratio(mask) > 0.92
     quality_ok = bool(mask.sum() >= 16 and not box_like_flag)
     if box_like_flag:
-        return quality_ok, box_like_flag, "box_like"
+        return quality_ok, box_like_flag, "box_like_after_refine" if refined else "box_like"
     if mask.sum() < 16:
         return quality_ok, box_like_flag, "too_small"
     return quality_ok, box_like_flag, "ok"
 
 
+def _clip_point_xy(x: float, y: float, width: int, height: int) -> tuple[float, float]:
+    return (
+        float(np.clip(x, 0.0, max(width - 1, 0))),
+        float(np.clip(y, 0.0, max(height - 1, 0))),
+    )
+
+
+def _mask_centroid_xy(mask: np.ndarray) -> tuple[float, float]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        height, width = mask.shape
+        return float(width * 0.5), float(height * 0.5)
+    return float(xs.mean()), float(ys.mean())
+
+
+def _build_refine_points(mask: np.ndarray) -> tuple[list[list[float]], list[int]]:
+    height, width = mask.shape
+    x0, y0, x1, y1 = mask_tight_bbox_xyxy(mask)
+    cx, cy = _mask_centroid_xy(mask)
+    margin = max(int(round(max(x1 - x0 + 1, y1 - y0 + 1) * 0.06)), 3)
+    neg_points = [
+        _clip_point_xy(x0 - margin, cy, width, height),
+        _clip_point_xy(x1 + margin, cy, width, height),
+        _clip_point_xy(cx, y0 - margin, width, height),
+        _clip_point_xy(cx, y1 + margin, width, height),
+    ]
+    pos_point = _clip_point_xy(cx, cy, width, height)
+    denom = np.array([max(width, 1), max(height, 1)], dtype=np.float32)
+    points = [list((np.array(pos_point, dtype=np.float32) / denom).tolist())]
+    points.extend(list((np.array(point, dtype=np.float32) / denom).tolist()) for point in neg_points)
+    labels = [1] + [0] * len(neg_points)
+    return points, labels
+
+
+def _collect_box_like_candidates(prompt_outputs: Mapping[int, dict]) -> dict[int, dict]:
+    candidates: dict[int, dict] = {}
+    for frame_offset, output in prompt_outputs.items():
+        masks, boxes, scores, obj_ids = _masks_from_output(output)
+        for obj_idx in range(masks.shape[0]):
+            mask = masks[obj_idx]
+            _, box_like_flag, _ = _quality_flags(mask, refined=False)
+            if not box_like_flag:
+                continue
+            obj_id = int(obj_ids[obj_idx])
+            area = int(mask.sum())
+            candidate = candidates.get(obj_id)
+            if candidate is None or area > candidate["area"]:
+                candidates[obj_id] = {
+                    "frame_offset": int(frame_offset),
+                    "mask": mask,
+                    "area": area,
+                    "score": float(scores[obj_idx]) if obj_idx < len(scores) else 0.0,
+                }
+    return candidates
+
+
+def _refine_box_like_tracks(predictor, session_id: str, prompt_outputs: Mapping[int, dict]) -> tuple[Dict[int, dict], set[int]]:
+    candidates = _collect_box_like_candidates(prompt_outputs)
+    if not candidates:
+        return dict(prompt_outputs), set()
+    refined_obj_ids: set[int] = set()
+    for obj_id, candidate in sorted(candidates.items(), key=lambda item: (item[1]["frame_offset"], item[0])):
+        points, point_labels = _build_refine_points(candidate["mask"])
+        predictor.handle_request(
+            request={
+                "type": "add_prompt",
+                "session_id": session_id,
+                "frame_index": int(candidate["frame_offset"]),
+                "points": points,
+                "point_labels": point_labels,
+                "obj_id": int(obj_id),
+            }
+        )
+        refined_obj_ids.add(int(obj_id))
+    return _propagate_session(predictor, session_id), refined_obj_ids
+
+
+def _start_and_propagate(predictor, video_dir: Path, prompt: str) -> tuple[Dict[int, dict], set[int]]:
+    response = predictor.handle_request(request={"type": "start_session", "resource_path": str(video_dir)})
+    session_id = response["session_id"]
+    predictor.handle_request(
+        request={
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 0,
+            "text": prompt,
+        }
+    )
+    outputs = _propagate_session(predictor, session_id)
+    outputs, refined_obj_ids = _refine_box_like_tracks(predictor, session_id, outputs)
+    predictor.handle_request(request={"type": "close_session", "session_id": session_id})
+    return outputs, refined_obj_ids
+
+
 def _track_box_compatibility(prompt: str, track_cls: int) -> float:
+    if prompt in {"cyclist", "bicyclist", "motorcyclist"}:
+        return 1.0 if int(track_cls) in {PROMPT_TO_CLASS["bicycle"], PROMPT_TO_CLASS["motorcycle"]} else 0.0
     expected = PROMPT_TO_CLASS.get(prompt, -1)
     return 1.0 if expected == int(track_cls) else 0.0
 
@@ -338,7 +442,7 @@ def _window_records(
         tmp_dir = Path(tmp)
         _write_view_symlinks(image_paths, tmp_dir)
         for prompt in prompts:
-            prompt_outputs = _start_and_propagate(predictor, tmp_dir, prompt)
+            prompt_outputs, refined_obj_ids = _start_and_propagate(predictor, tmp_dir, prompt)
             window_tracks: Dict[int, dict] = {}
             for frame_offset, frame_id in enumerate(frame_ids_10hz):
                 output = prompt_outputs.get(frame_offset, {})
@@ -347,8 +451,15 @@ def _window_records(
                     temp_id = int(obj_ids[obj_idx])
                     track = window_tracks.setdefault(
                         temp_id,
-                        {"class_name": prompt, "frames": {}, "boxes": {}, "scores": []},
+                        {
+                            "class_name": prompt,
+                            "frames": {},
+                            "boxes": {},
+                            "scores": [],
+                            "refined": bool(temp_id in refined_obj_ids),
+                        },
                     )
+                    track["refined"] = bool(track["refined"] or temp_id in refined_obj_ids)
                     track["frames"][scene_frame_start + frame_offset] = masks[obj_idx]
                     track["boxes"][scene_frame_start + frame_offset] = _xywh_to_xyxy(boxes[obj_idx]) if obj_idx < len(boxes) else [0, 0, 0, 0]
                     track["scores"].append(float(scores[obj_idx]) if obj_idx < len(scores) else 0.0)
@@ -368,7 +479,7 @@ def _window_records(
                     frame_offset = global_frame_idx - scene_frame_start
                     if frame_offset < 0 or frame_offset >= len(frame_ids_10hz):
                         continue
-                    quality_ok, box_like_flag, quality_reason = _quality_flags(mask, refined=False)
+                    quality_ok, box_like_flag, quality_reason = _quality_flags(mask, refined=bool(track["refined"]))
                     bbox_tight = mask_tight_bbox_xyxy(mask)
                     records.append(
                         {
@@ -383,7 +494,7 @@ def _window_records(
                             "bbox_mask_tight": bbox_tight,
                             "visible_area": int(mask.sum()),
                             "rle": binary_mask_to_rle(mask),
-                            "refined": False,
+                            "refined": bool(track["refined"]),
                             "quality_ok": bool(quality_ok),
                             "box_like_flag": bool(box_like_flag),
                             "quality_reason": quality_reason,
@@ -617,7 +728,10 @@ def main() -> None:
         scene_entries = scene_entries[: args.limit_scenes]
     scene_entries = shard_items(scene_entries, shard_index=shard_index, num_shards=num_shards)
 
-    predictor = build_sam3_video_predictor(checkpoint_path=str(args.sam3_ckpt), gpus_to_use=None)
+    predictor = build_sam3_video_predictor(
+        checkpoint_path=str(args.sam3_ckpt),
+        gpus_to_use=_predictor_gpu_ids_from_env(),
+    )
     try:
         for entry in scene_entries:
             dirs = entry_output_dirs(entry, output_root)

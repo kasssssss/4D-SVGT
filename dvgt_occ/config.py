@@ -39,7 +39,7 @@ class DVGTOccConfig:
     motion_dim: int = 16
     dynamic_classes: int = 8
     semantic_classes: int = 18
-    projected_semantic_classes: int = 8
+    projected_semantic_classes: int = 9
     max_track_queries: int = 64
     new_queries: int = 64
     sparse_dynamic_anchors: int = 2048
