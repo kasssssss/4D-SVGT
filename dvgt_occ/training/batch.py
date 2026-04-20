@@ -140,6 +140,8 @@ def collate_dvgt_occ_batch(samples: List[Mapping[str, object]]) -> Dict[str, obj
         batch["sam3_all_mask_full"] = _stack_fixed([item["sam3_all_mask_full"] for item in sam3_full]).float()
         batch["sam3_semantic_full"] = _stack_fixed([item["sam3_semantic_full"] for item in sam3_full]).float()
         batch["sam3_valid_mask_full"] = _stack_fixed([item["sam3_valid_mask_full"] for item in sam3_full]).float()
+        if "sky_mask_full" in sam3_full[0]:
+            batch["sky_mask_full"] = _stack_fixed([item["sky_mask_full"] for item in sam3_full]).float()
     size_hw = tuple(int(dim) for dim in batch["points"].shape[3:5])
     batch["rgb_target"] = _stack_fixed(
         [

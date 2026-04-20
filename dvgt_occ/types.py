@@ -120,5 +120,13 @@ class RenderOutput:
     render_alpha_dynamic: torch.Tensor
     render_alpha_all: torch.Tensor
     sem_proj_2d: torch.Tensor
+    render_rgb_background: Optional[torch.Tensor] = None
+    render_rgb_all_composited: Optional[torch.Tensor] = None
     debug_mean_sigma: Optional[torch.Tensor] = None
     debug_touch_ratio: Optional[torch.Tensor] = None
+
+
+@dataclass
+class SkyOutput:
+    render_rgb_background: torch.Tensor
+    sky_mask_full: Optional[torch.Tensor] = None

@@ -1,5 +1,7 @@
 """Top-level scaffold that wires the first model interfaces together."""
 
+import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,7 +20,8 @@ from dvgt_occ.models.occupancy import OccHead
 from dvgt_occ.models.projection import OccSemanticProjector
 from dvgt_occ.models.reassembly import TokenReassembly
 from dvgt_occ.models.rendering import GaussianMaskRenderer
-from dvgt_occ.types import BridgeOutput, EntityOutput
+from dvgt_occ.models.sky import SkyRayBackground
+from dvgt_occ.types import BridgeOutput, EntityOutput, GaussianAssignmentOutput, SkyOutput
 
 
 class DVGTOccModel(nn.Module):
@@ -93,51 +96,165 @@ class DVGTOccModel(nn.Module):
             output_size=(config.image_height, config.image_width),
             splat_radius=config.render_splat_radius,
         )
+        self.sky_model = SkyRayBackground(
+            hidden_dim=config.sky_hidden_dim,
+            fourier_freqs=config.sky_fourier_freqs,
+        )
+        self.train_target = "joint"
 
     def enable_gradient_checkpointing(self, enabled: bool = True) -> None:
         self.dynamic_dense.set_gradient_checkpointing(enabled)
         self.occ_head.set_gradient_checkpointing(enabled)
         self.gs_head.set_gradient_checkpointing(enabled)
 
+    def set_train_target(self, train_target: str) -> None:
+        self.train_target = str(train_target)
+
+    def configure_optional_modules(self, active_loss_weights: dict | None) -> None:
+        return
+
     def forward(self, batch: dict) -> dict:
-        features = self.reassembly(batch["aggregated_tokens"])
+        active_loss_weights = batch.get("_active_loss_weights")
+        profile_timing = bool(batch.get("_profile_timing", False))
+        timings_ms: dict[str, float] = {}
+
+        def _record_timing(name: str, fn):
+            if not profile_timing:
+                return fn()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+            out = fn()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            timings_ms[name] = (time.perf_counter() - start) * 1000.0
+            return out
+
+        def _weight(name: str) -> float:
+            if not isinstance(active_loss_weights, dict):
+                return 1.0
+            return float(active_loss_weights.get(name, 0.0))
+
+        optimize_for_training = isinstance(active_loss_weights, dict)
+        render_full_branches = not optimize_for_training
+
+        with torch.autograd.profiler.record_function("dvgt_occ/reassembly"):
+            features = _record_timing("reassembly", lambda: self.reassembly(batch["aggregated_tokens"]))
         points = batch["points"]
         points_conf = batch["points_conf"]
         xyz_1_4 = self._downsample_points(points, size=(56, 112))
         conf_1_4 = self._downsample_conf(points_conf, size=(56, 112))
         xyz_1_8 = self._downsample_points(points, size=(28, 56))
-        dynamic = self.dynamic_dense(features, xyz_1_4=xyz_1_4, conf_1_4=conf_1_4)
-        occ = self.occ_head(features, dynamic=dynamic, points=points, points_conf=points_conf)
-        queries = self.dynamic_query(
-            occ.occ_volumes,
-            dynamic_feat_1_4=dynamic.dyn_feat_1_4,
-            dynamic_logit_1_4=dynamic.dyn_logit_1_4,
-            dynamic_xyz_1_4=xyz_1_4,
-            batch=batch,
-        )
-        gaussians = self.gs_head(features, dynamic=dynamic, xyz_1_8=xyz_1_8)
+        with torch.autograd.profiler.record_function("dvgt_occ/dynamic_dense"):
+            dynamic = _record_timing(
+                "dynamic_dense",
+                lambda: self.dynamic_dense(features, xyz_1_4=xyz_1_4, conf_1_4=conf_1_4),
+            )
+        if self.train_target == "occ_only":
+            with torch.autograd.profiler.record_function("dvgt_occ/occ_head"):
+                occ = _record_timing("occ_head", lambda: self.occ_head(features, dynamic=dynamic, points=points, points_conf=points_conf))
+            outputs = {
+                "dynamic": dynamic,
+                "occ": occ,
+            }
+            sky = self._run_sky_model(batch)
+            if sky is not None:
+                outputs["sky"] = sky
+            if profile_timing:
+                outputs["timings_ms"] = timings_ms
+            return outputs
+
+        if self.train_target == "gs_only":
+            with torch.autograd.profiler.record_function("dvgt_occ/gs_head"):
+                gaussians = _record_timing("gs_head", lambda: self.gs_head(features, dynamic=dynamic, xyz_1_8=xyz_1_8))
+            with torch.autograd.profiler.record_function("dvgt_occ/gaussian_merge"):
+                gaussians_merged = _record_timing("gaussian_merge", lambda: self.gaussian_merge(gaussians, global_track_id=None))
+            dummy_assignment = self._build_dummy_assignment(gaussians_merged)
+            dummy_sem_proj_2d = self._build_dummy_sem_proj(batch, gaussians_merged.center.dtype)
+            with torch.autograd.profiler.record_function("dvgt_occ/mask_renderer"):
+                render = _record_timing(
+                    "mask_renderer",
+                    lambda: self.mask_renderer(
+                        gaussians_merged,
+                        dummy_assignment,
+                        dummy_sem_proj_2d,
+                        camera_intrinsics=batch["camera_intrinsics"],
+                        camera_to_world=batch["camera_to_world"],
+                        first_ego_pose_world=batch["first_ego_pose_world"],
+                        compute_static_branch=False,
+                        compute_dynamic_rgb=False,
+                    ),
+                )
+            outputs = {
+                "dynamic": dynamic,
+                "gaussians": gaussians_merged,
+                "gaussians_pre_merge": gaussians,
+                "assignment": dummy_assignment,
+                "render": render,
+            }
+            sky = self._run_sky_model(batch)
+            if sky is not None:
+                outputs["sky"] = sky
+                render.render_rgb_background = sky.render_rgb_background
+                render.render_rgb_all_composited = (
+                    render.render_alpha_all * render.render_rgb_all
+                    + (1.0 - render.render_alpha_all) * sky.render_rgb_background
+                )
+            if profile_timing:
+                outputs["timings_ms"] = timings_ms
+            return outputs
+
+        with torch.autograd.profiler.record_function("dvgt_occ/occ_head"):
+            occ = _record_timing("occ_head", lambda: self.occ_head(features, dynamic=dynamic, points=points, points_conf=points_conf))
+        with torch.autograd.profiler.record_function("dvgt_occ/dynamic_query"):
+            queries = _record_timing(
+                "dynamic_query",
+                lambda: self.dynamic_query(
+                    occ.occ_volumes,
+                    dynamic_feat_1_4=dynamic.dyn_feat_1_4,
+                    dynamic_logit_1_4=dynamic.dyn_logit_1_4,
+                    dynamic_xyz_1_4=xyz_1_4,
+                    batch=batch,
+                ),
+            )
+        with torch.autograd.profiler.record_function("dvgt_occ/gs_head"):
+            gaussians = _record_timing("gs_head", lambda: self.gs_head(features, dynamic=dynamic, xyz_1_8=xyz_1_8))
         global_track_id = batch.get("gs_global_track_id_1_8")
-        gaussians_merged = self.gaussian_merge(gaussians, global_track_id=global_track_id)
-        assignment = self.gaussian_assignment(gaussians_merged, queries)
-        bridges = self._run_bridges(gaussians_merged, occ)
-        entities = self.entity_aggregator(gaussians_merged, queries, assignment)
-        entities = self._inject_bridge_context(entities, bridges)
-        sem_proj_2d = self.occ_semantic_projector(
-            occ.occ_logit,
-            occ.sem_logit,
-            camera_intrinsics=batch["camera_intrinsics"],
-            camera_to_world=batch["camera_to_world"],
-            first_ego_pose_world=batch["first_ego_pose_world"],
-        )
-        render = self.mask_renderer(
-            gaussians_merged,
-            assignment,
-            sem_proj_2d,
-            camera_intrinsics=batch["camera_intrinsics"],
-            camera_to_world=batch["camera_to_world"],
-            first_ego_pose_world=batch["first_ego_pose_world"],
-        )
-        return {
+        with torch.autograd.profiler.record_function("dvgt_occ/gaussian_merge"):
+            gaussians_merged = _record_timing("gaussian_merge", lambda: self.gaussian_merge(gaussians, global_track_id=global_track_id))
+        with torch.autograd.profiler.record_function("dvgt_occ/query_assignment"):
+            assignment = _record_timing("query_assignment", lambda: self.gaussian_assignment(gaussians_merged, queries))
+        with torch.autograd.profiler.record_function("dvgt_occ/bridges"):
+            bridges = _record_timing("bridges", lambda: self._run_bridges(gaussians_merged, occ))
+        with torch.autograd.profiler.record_function("dvgt_occ/entity_aggregator"):
+            entities = _record_timing("entity_aggregator", lambda: self.entity_aggregator(gaussians_merged, queries, assignment))
+            entities = _record_timing("inject_bridge_context", lambda: self._inject_bridge_context(entities, bridges))
+        with torch.autograd.profiler.record_function("dvgt_occ/occ_semantic_projector"):
+            sem_proj_2d = _record_timing(
+                "occ_semantic_projector",
+                lambda: self.occ_semantic_projector(
+                    occ.occ_logit,
+                    occ.sem_logit,
+                    camera_intrinsics=batch["camera_intrinsics"],
+                    camera_to_world=batch["camera_to_world"],
+                    first_ego_pose_world=batch["first_ego_pose_world"],
+                ),
+            )
+        with torch.autograd.profiler.record_function("dvgt_occ/mask_renderer"):
+            render = _record_timing(
+                "mask_renderer",
+                lambda: self.mask_renderer(
+                    gaussians_merged,
+                    assignment,
+                    sem_proj_2d,
+                    camera_intrinsics=batch["camera_intrinsics"],
+                    camera_to_world=batch["camera_to_world"],
+                    first_ego_pose_world=batch["first_ego_pose_world"],
+                    compute_static_branch=render_full_branches,
+                    compute_dynamic_rgb=render_full_branches,
+                ),
+            )
+        outputs = {
             "dynamic": dynamic,
             "occ": occ,
             "queries": queries,
@@ -148,6 +265,32 @@ class DVGTOccModel(nn.Module):
             "bridges": bridges,
             "render": render,
         }
+        sky = self._run_sky_model(batch)
+        if sky is not None:
+            outputs["sky"] = sky
+            render.render_rgb_background = sky.render_rgb_background
+            render.render_rgb_all_composited = (
+                render.render_alpha_all * render.render_rgb_all
+                + (1.0 - render.render_alpha_all) * sky.render_rgb_background
+            )
+        if profile_timing:
+            outputs["timings_ms"] = timings_ms
+        return outputs
+
+    def _run_sky_model(self, batch: dict) -> SkyOutput | None:
+        camera_intrinsics = batch.get("camera_intrinsics")
+        camera_to_world = batch.get("camera_to_world")
+        if camera_intrinsics is None or camera_to_world is None:
+            return None
+        sky_rgb = self.sky_model(
+            camera_intrinsics=camera_intrinsics,
+            camera_to_world=camera_to_world,
+            image_size=(self.config.image_height, self.config.image_width),
+        )
+        return SkyOutput(
+            render_rgb_background=sky_rgb,
+            sky_mask_full=batch.get("sky_mask_full"),
+        )
 
     def _run_bridges(self, gaussians, occ) -> BridgeOutput:
         gs_features = torch.cat([gaussians.instance_affinity, gaussians.motion_code], dim=-1)
@@ -186,6 +329,33 @@ class DVGTOccModel(nn.Module):
             refined_instance_affinity=entities.refined_instance_affinity + local_inst + global_inst,
             refined_motion_code=entities.refined_motion_code + local_motion + global_motion,
             gs_to_occ_feat=bridges.gs_to_occ_local,
+        )
+
+    def _build_dummy_assignment(self, gaussians) -> GaussianAssignmentOutput:
+        b = gaussians.center.shape[0]
+        num_gauss = gaussians.center.shape[1] * gaussians.center.shape[2] * gaussians.center.shape[3] * gaussians.center.shape[4]
+        device = gaussians.center.device
+        dtype = gaussians.center.dtype
+        return GaussianAssignmentOutput(
+            assignment_prob=torch.cat(
+                [
+                    torch.zeros((b, num_gauss, 1), device=device, dtype=dtype),
+                    torch.ones((b, num_gauss, 1), device=device, dtype=dtype),
+                ],
+                dim=-1,
+            ),
+            assigned_query=torch.full((b, num_gauss), -1, device=device, dtype=torch.long),
+            background_prob=torch.zeros((b, num_gauss), device=device, dtype=dtype),
+            local_gate=torch.ones((b, num_gauss, 1), device=device, dtype=dtype),
+            routing_keep_score=gaussians.keep_score.reshape(b, num_gauss, 1),
+        )
+
+    def _build_dummy_sem_proj(self, batch: dict, dtype: torch.dtype) -> torch.Tensor:
+        b, t, v = batch["camera_to_world"].shape[:3]
+        return torch.zeros(
+            (b, t, v, self.config.projected_semantic_classes, self.config.image_height, self.config.image_width),
+            device=batch["camera_to_world"].device,
+            dtype=dtype,
         )
 
     @staticmethod

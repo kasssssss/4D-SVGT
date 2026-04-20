@@ -99,25 +99,57 @@ class DVGTOccLossBuilder(nn.Module):
 
     def forward(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         reference = outputs["dynamic"].dyn_logit_1_4
-        losses: Dict[str, torch.Tensor] = {}
+        losses: Dict[str, torch.Tensor] = {
+            key: _zero_like(reference) for key in asdict(self.weights).keys()
+        }
 
-        losses["dyn_soft"] = self._loss_dyn_soft(outputs, batch)
-        losses["presence"], losses["query_match"], losses["query_cls"], losses["query_box3d"] = self._loss_queries(outputs, batch)
-        losses["track_mem_feat"] = self._loss_entity_motion(outputs, batch)
-        losses["track_mem_box"] = self._loss_query_motion(outputs, batch)
-        losses["birth_death"] = self._loss_birth_death(outputs, batch)
-        losses["occ"] = self._loss_occ(outputs, batch)
-        losses["sem_occ"] = self._loss_sem_occ(outputs, batch)
-        losses["dyn_occ"] = self._loss_dyn_occ(outputs, batch)
-        losses["gs_render"] = self._loss_gs_render(outputs, batch)
-        losses["inst_contrast"] = self._loss_instance_contrast(outputs, batch)
-        losses["query2gs"], losses["q2gs_null"] = self._loss_query_to_gaussian(outputs, batch)
-        losses["mask_render"] = self._loss_dyn_mask_full(outputs, batch)
-        losses["occ_local2gs"] = self._loss_occ_local2gs(outputs, batch)
-        losses["gs2occ_local"] = self._loss_gs2occ_local(outputs, batch)
-        losses["sem_proj_2d"] = self._loss_sem_proj_2d(outputs, batch)
-        losses["motion_cons"] = self._loss_motion_cons(outputs, batch)
-        losses["gs_sparse"] = self._loss_gs_sparse(outputs, batch)
+        if self.weights.dyn_soft > 0.0:
+            losses["dyn_soft"] = self._loss_dyn_soft(outputs, batch)
+        if any(
+            weight > 0.0
+            for weight in (
+                self.weights.presence,
+                self.weights.query_match,
+                self.weights.query_cls,
+                self.weights.query_box3d,
+            )
+        ) and outputs.get("queries") is not None:
+            (
+                losses["presence"],
+                losses["query_match"],
+                losses["query_cls"],
+                losses["query_box3d"],
+            ) = self._loss_queries(outputs, batch)
+        if self.weights.track_mem_feat > 0.0 and outputs.get("entities") is not None:
+            losses["track_mem_feat"] = self._loss_entity_motion(outputs, batch)
+        if self.weights.track_mem_box > 0.0 and outputs.get("queries") is not None:
+            losses["track_mem_box"] = self._loss_query_motion(outputs, batch)
+        if self.weights.birth_death > 0.0 and outputs.get("queries") is not None:
+            losses["birth_death"] = self._loss_birth_death(outputs, batch)
+        if self.weights.occ > 0.0 and outputs.get("occ") is not None:
+            losses["occ"] = self._loss_occ(outputs, batch)
+        if self.weights.sem_occ > 0.0 and outputs.get("occ") is not None:
+            losses["sem_occ"] = self._loss_sem_occ(outputs, batch)
+        if self.weights.dyn_occ > 0.0 and outputs.get("occ") is not None:
+            losses["dyn_occ"] = self._loss_dyn_occ(outputs, batch)
+        if self.weights.gs_render > 0.0 and outputs.get("render") is not None:
+            losses["gs_render"] = self._loss_gs_render(outputs, batch)
+        if self.weights.inst_contrast > 0.0 and outputs.get("entities") is not None:
+            losses["inst_contrast"] = self._loss_instance_contrast(outputs, batch)
+        if any(weight > 0.0 for weight in (self.weights.query2gs, self.weights.q2gs_null)) and outputs.get("assignment") is not None:
+            losses["query2gs"], losses["q2gs_null"] = self._loss_query_to_gaussian(outputs, batch)
+        if self.weights.mask_render > 0.0 and outputs.get("render") is not None:
+            losses["mask_render"] = self._loss_dyn_mask_full(outputs, batch)
+        if self.weights.occ_local2gs > 0.0 and outputs.get("bridges") is not None and outputs.get("entities") is not None:
+            losses["occ_local2gs"] = self._loss_occ_local2gs(outputs, batch)
+        if self.weights.gs2occ_local > 0.0 and outputs.get("bridges") is not None:
+            losses["gs2occ_local"] = self._loss_gs2occ_local(outputs, batch)
+        if self.weights.sem_proj_2d > 0.0 and outputs.get("render") is not None:
+            losses["sem_proj_2d"] = self._loss_sem_proj_2d(outputs, batch)
+        if self.weights.motion_cons > 0.0 and outputs.get("entities") is not None and outputs.get("gaussians") is not None:
+            losses["motion_cons"] = self._loss_motion_cons(outputs, batch)
+        if self.weights.gs_sparse > 0.0 and outputs.get("gaussians") is not None:
+            losses["gs_sparse"] = self._loss_gs_sparse(outputs, batch)
         losses["ddp_tether"] = self._loss_ddp_tether(outputs)
 
         total = _zero_like(reference)
@@ -163,7 +195,10 @@ class DVGTOccLossBuilder(nn.Module):
         if "render" not in outputs or "rgb_target" not in batch or "points_conf" not in batch:
             return _zero_like(outputs["dynamic"].dyn_logit_1_4)
 
+        train_mode = str(batch.get("_train_mode", "v1-stable"))
         pred = outputs["render"].render_rgb_all
+        if train_mode == "v1-sky-ablation" and outputs["render"].render_rgb_all_composited is not None:
+            pred = outputs["render"].render_rgb_all_composited
         target = batch["rgb_target"]
         conf = batch["points_conf"]
         valid = self._build_render_valid_mask(conf)
@@ -365,6 +400,8 @@ class DVGTOccLossBuilder(nn.Module):
         return _masked_balanced_bce_with_logits(pred, target, valid) + _masked_soft_dice_loss_from_logits(pred, target, valid)
 
     def _loss_motion_cons(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if outputs.get("entities") is None:
+            return _zero_like(outputs["dynamic"].dyn_logit_1_4)
         gauss_motion = outputs["gaussians"].motion_code[..., : outputs["entities"].refined_motion_code.shape[-1]]
         return F.smooth_l1_loss(outputs["entities"].refined_motion_code, gauss_motion)
 
@@ -426,10 +463,14 @@ class DVGTOccLossBuilder(nn.Module):
         if queries is not None:
             tether = tether + queries.query_cls_logit.sum() * 0.0
             tether = tether + queries.query_motion.sum() * 0.0
-        occ_aux = getattr(outputs["occ"], "aux_decoder_full", None)
+        occ = outputs.get("occ")
+        occ_aux = getattr(occ, "aux_decoder_full", None)
         if occ_aux is not None:
             tether = tether + occ_aux.sum() * 0.0
-        gs_aux = getattr(outputs.get("gaussians_pre_merge", outputs["gaussians"]), "aux_decoder_full", None)
+        gaussians = outputs.get("gaussians_pre_merge")
+        if gaussians is None:
+            gaussians = outputs.get("gaussians")
+        gs_aux = getattr(gaussians, "aux_decoder_full", None)
         if gs_aux is not None:
             tether = tether + gs_aux.sum() * 0.0
         bridges = outputs.get("bridges")

@@ -153,6 +153,8 @@ def build_runtime_config(args: argparse.Namespace, cfg: Dict[str, object]) -> Di
         "grad_clip": float(train_cfg.get("grad_clip", 1.0)),
         "amp": bool(train_cfg.get("amp", True)),
         "gradient_checkpointing": bool(train_cfg.get("gradient_checkpointing", False)),
+        "train_target": str(train_cfg.get("train_target", "joint")),
+        "train_mode": str(train_cfg.get("train_mode", "v1-stable")),
         "warmup_iters": int(train_cfg.get("warmup_iters", 1500)),
         "min_lr": float(train_cfg.get("min_lr", 1e-6)),
         "require_supervision_frozen": bool(data_cfg.get("require_supervision_frozen", False)),
@@ -214,6 +216,7 @@ def build_optimizer(model: torch.nn.Module, cfg: Dict[str, object]) -> torch.opt
     opt_cfg = dict(cfg.get("optimizer", {}))
     base_lr = float(opt_cfg.get("base_lr", 2e-4))
     gs_lr = float(opt_cfg.get("gs_lr", 1e-4))
+    sky_lr = float(opt_cfg.get("sky_lr", gs_lr))
     bridge_lr = float(opt_cfg.get("bridge_lr", 1e-4))
     betas = tuple(opt_cfg.get("betas", [0.9, 0.999]))
     weight_decay = float(opt_cfg.get("weight_decay", 1e-4))
@@ -221,6 +224,7 @@ def build_optimizer(model: torch.nn.Module, cfg: Dict[str, object]) -> torch.opt
     groups = {
         "base": {"params": [], "lr": base_lr},
         "gs": {"params": [], "lr": gs_lr},
+        "sky": {"params": [], "lr": sky_lr},
         "bridge": {"params": [], "lr": bridge_lr},
     }
     for name, param in model.named_parameters():
@@ -228,11 +232,42 @@ def build_optimizer(model: torch.nn.Module, cfg: Dict[str, object]) -> torch.opt
             continue
         if name.startswith("gs_head."):
             groups["gs"]["params"].append(param)
+        elif name.startswith("sky_model."):
+            groups["sky"]["params"].append(param)
         elif "global_latent_bridge" in name or "gs_occ_global_latent_bridge" in name:
             groups["bridge"]["params"].append(param)
         else:
             groups["base"]["params"].append(param)
     return torch.optim.AdamW([group for group in groups.values() if group["params"]], betas=betas, weight_decay=weight_decay)
+
+
+def configure_trainable_modules(model: torch.nn.Module, train_target: str, train_mode: str = "v1-stable") -> None:
+    train_target = str(train_target)
+    train_mode = str(train_mode)
+    for _, param in model.named_parameters():
+        param.requires_grad_(False)
+
+    enabled_prefixes: tuple[str, ...]
+    disabled_prefixes: tuple[str, ...] = ()
+    if train_target == "occ_only":
+        enabled_prefixes = ("reassembly.", "dynamic_dense.", "occ_head.")
+    elif train_target == "gs_only":
+        enabled_prefixes = ("reassembly.", "dynamic_dense.", "gs_head.")
+        if train_mode == "v1-sky-ablation":
+            enabled_prefixes = enabled_prefixes + ("sky_model.",)
+    elif train_target == "sky_only":
+        enabled_prefixes = ("sky_model.",)
+    else:
+        enabled_prefixes = ("",)
+        if train_mode == "v1-stable":
+            disabled_prefixes = ("sky_model.",)
+
+    for name, param in model.named_parameters():
+        if any(name.startswith(prefix) for prefix in enabled_prefixes) and not any(name.startswith(prefix) for prefix in disabled_prefixes):
+            param.requires_grad_(True)
+
+    if hasattr(model, "set_train_target"):
+        model.set_train_target(train_target)
 
 
 def adjust_learning_rate(optimizer: torch.optim.Optimizer, step: int, max_steps: int, warmup_iters: int, min_lr: float) -> None:
@@ -447,12 +482,17 @@ def collect_debug_metrics_with_batch(outputs: Dict[str, object], batch: Dict[str
     if assignment is not None:
         metrics["debug_assign_bg_mean"] = assignment.background_prob.mean()
         metrics["debug_assign_bg_gt_05_ratio"] = (assignment.background_prob > 0.5).float().mean()
-        metrics["debug_assign_fg_max_mean"] = assignment.assignment_prob[..., 1:].max(dim=-1).values.mean()
+        if assignment.assignment_prob.shape[-1] > 1:
+            metrics["debug_assign_fg_max_mean"] = assignment.assignment_prob[..., 1:].max(dim=-1).values.mean()
+        else:
+            metrics["debug_assign_fg_max_mean"] = torch.zeros_like(assignment.background_prob.mean())
         metrics["debug_assign_pos_ratio"] = (assignment.assigned_query >= 0).float().mean()
         metrics["debug_assign_gate_active"] = (assignment.local_gate > 0.5).float().mean()
         metrics["debug_assign_unique_query_mean"] = torch.stack(
             [
-                assignment.assigned_query[batch_idx][assignment.assigned_query[batch_idx] >= 0].unique().numel()
+                assignment.assigned_query.new_tensor(
+                    assignment.assigned_query[batch_idx][assignment.assigned_query[batch_idx] >= 0].unique().numel()
+                )
                 if bool((assignment.assigned_query[batch_idx] >= 0).any().item())
                 else assignment.assigned_query.new_tensor(0)
                 for batch_idx in range(assignment.assigned_query.shape[0])
@@ -507,33 +547,44 @@ def evaluate(
         if max_batches > 0 and batch_idx >= max_batches:
             break
         batch = move_batch_to_device(batch, device)
+        batch["_train_mode"] = runtime["train_mode"]
+        batch["_active_loss_weights"] = loss_builder.weights.to_dict()
+        if hasattr(model, "module") and hasattr(model.module, "configure_optional_modules"):
+            model.module.configure_optional_modules(batch["_active_loss_weights"])
+        elif hasattr(model, "configure_optional_modules"):
+            model.configure_optional_modules(batch["_active_loss_weights"])
         outputs = model(batch)
         outputs["step_hint"] = 0
         loss_total, loss_dict = loss_builder(outputs, batch)
-        occ_logits = outputs["occ"].occ_logit
-        occ_target = batch["occ_label"]
-        dyn_logits = torch.logit(outputs["render"].render_alpha_dynamic.clamp(1e-4, 1.0 - 1e-4))
-        dyn_target = batch["sam3_dyn_mask_full"].unsqueeze(3)
-        dyn_valid = batch.get("sam3_valid_mask_full")
-        if dyn_valid is not None:
-            dyn_valid = dyn_valid.unsqueeze(3)
-        render_valid = render_valid_mask_from_points_conf(batch["points_conf"])
         metrics = {
             f"{prefix}_loss_total": loss_total.detach(),
-            f"{prefix}_occ_iou": binary_iou_from_logits(occ_logits, occ_target),
-            f"{prefix}_occ_soft_iou": soft_iou_from_logits(occ_logits, occ_target),
-            f"{prefix}_dyn_mask_iou": binary_iou_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid),
-            f"{prefix}_render_l1": masked_l1(outputs["render"].render_rgb_all, batch["rgb_target"], render_valid),
-            f"{prefix}_render_psnr": masked_psnr(outputs["render"].render_rgb_all, batch["rgb_target"], render_valid),
         }
-        for key, value in binary_stats_from_logits(occ_logits, occ_target).items():
-            metrics[f"{prefix}_occ_{key}"] = value
-        for key, value in iou_threshold_sweep_from_logits(occ_logits, occ_target).items():
-            metrics[f"{prefix}_occ_{key}"] = value
-        for key, value in binary_stats_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid).items():
-            metrics[f"{prefix}_dyn_mask_{key}"] = value
-        for key, value in iou_threshold_sweep_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid).items():
-            metrics[f"{prefix}_dyn_mask_{key}"] = value
+        if outputs.get("occ") is not None:
+            occ_logits = outputs["occ"].occ_logit
+            occ_target = batch["occ_label"]
+            metrics[f"{prefix}_occ_iou"] = binary_iou_from_logits(occ_logits, occ_target)
+            metrics[f"{prefix}_occ_soft_iou"] = soft_iou_from_logits(occ_logits, occ_target)
+            for key, value in binary_stats_from_logits(occ_logits, occ_target).items():
+                metrics[f"{prefix}_occ_{key}"] = value
+            for key, value in iou_threshold_sweep_from_logits(occ_logits, occ_target).items():
+                metrics[f"{prefix}_occ_{key}"] = value
+        if outputs.get("render") is not None:
+            render_valid = render_valid_mask_from_points_conf(batch["points_conf"])
+            render_pred = outputs["render"].render_rgb_all
+            if batch.get("_train_mode") == "v1-sky-ablation" and outputs["render"].render_rgb_all_composited is not None:
+                render_pred = outputs["render"].render_rgb_all_composited
+            metrics[f"{prefix}_render_l1"] = masked_l1(render_pred, batch["rgb_target"], render_valid)
+            metrics[f"{prefix}_render_psnr"] = masked_psnr(render_pred, batch["rgb_target"], render_valid)
+            dyn_logits = torch.logit(outputs["render"].render_alpha_dynamic.clamp(1e-4, 1.0 - 1e-4))
+            dyn_target = batch["sam3_dyn_mask_full"].unsqueeze(3)
+            dyn_valid = batch.get("sam3_valid_mask_full")
+            if dyn_valid is not None:
+                dyn_valid = dyn_valid.unsqueeze(3)
+            metrics[f"{prefix}_dyn_mask_iou"] = binary_iou_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid)
+            for key, value in binary_stats_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid).items():
+                metrics[f"{prefix}_dyn_mask_{key}"] = value
+            for key, value in iou_threshold_sweep_from_logits(dyn_logits, dyn_target, valid_mask=dyn_valid).items():
+                metrics[f"{prefix}_dyn_mask_{key}"] = value
         for key, value in loss_dict.items():
             metrics[f"{prefix}_loss_{key}"] = value.detach()
         for key, value in collect_debug_metrics_with_batch(outputs, batch).items():
@@ -603,6 +654,7 @@ def main() -> None:
 
         model = DVGTOccModel(config=model_cfg).to(device)
         raw_model = model
+        configure_trainable_modules(raw_model, runtime["train_target"], runtime["train_mode"])
         if runtime["gradient_checkpointing"] and hasattr(raw_model, "enable_gradient_checkpointing"):
             raw_model.enable_gradient_checkpointing(True)
         if ddp_enabled:
@@ -709,6 +761,10 @@ def main() -> None:
                 bridge_start_step=runtime["bridge_start_step"],
                 stability_start_step=runtime["stability_start_step"],
             )
+            batch["_train_mode"] = runtime["train_mode"]
+            batch["_active_loss_weights"] = loss_builder.weights.to_dict()
+            if hasattr(raw_model, "configure_optional_modules"):
+                raw_model.configure_optional_modules(batch["_active_loss_weights"])
             adjust_learning_rate(optimizer, step, runtime["max_steps"], runtime["warmup_iters"], runtime["min_lr"])
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32, enabled=autocast_enabled):
@@ -850,7 +906,12 @@ def main() -> None:
                     last_val_record = dict(val_metrics)
                     print(json.dumps(val_metrics, ensure_ascii=False), flush=True)
                     append_jsonl(log_dir / "val_metrics.jsonl", val_metrics)
-                    score = val_metrics.get("val_occ_iou", 0.0) + val_metrics.get("val_dyn_mask_iou", 0.0)
+                    if runtime["train_target"] == "gs_only":
+                        score = val_metrics.get("val_render_psnr", 0.0) - val_metrics.get("val_render_l1", 0.0)
+                    elif runtime["train_target"] == "occ_only":
+                        score = val_metrics.get("val_occ_best_iou", val_metrics.get("val_occ_iou", 0.0))
+                    else:
+                        score = val_metrics.get("val_occ_iou", 0.0) + val_metrics.get("val_dyn_mask_iou", 0.0)
                     if best_score is None or score > best_score:
                         best_score = score
                         save_checkpoint(log_dir / "best.pt", step, raw_model, optimizer, score=score)

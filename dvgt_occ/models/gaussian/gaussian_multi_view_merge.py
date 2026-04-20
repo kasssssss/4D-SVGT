@@ -64,20 +64,26 @@ class GaussianMultiViewMerge(nn.Module):
                     rep_v = int(sel_v[rep_idx].item())
                     rep_h = int(sel_h[rep_idx].item())
                     rep_w = int(sel_w[rep_idx].item())
+                    center_vals = center[batch_idx, time_idx, sel_v, sel_h, sel_w]
+                    offset_vals = offset[batch_idx, time_idx, sel_v, sel_h, sel_w]
+                    opacity_vals = opacity[batch_idx, time_idx, sel_v, sel_h, sel_w]
+                    scale_vals = scale[batch_idx, time_idx, sel_v, sel_h, sel_w]
+                    rotation_vals = rotation[batch_idx, time_idx, sel_v, sel_h, sel_w]
+                    feat_dc_vals = feat_dc[batch_idx, time_idx, sel_v, sel_h, sel_w]
+                    keep_vals = keep_score[batch_idx, time_idx, sel_v, sel_h, sel_w]
+                    instance_vals = instance_affinity[batch_idx, time_idx, sel_v, sel_h, sel_w]
+                    motion_vals = motion_code[batch_idx, time_idx, sel_v, sel_h, sel_w]
 
-                    def weighted_mean(tensor: torch.Tensor) -> torch.Tensor:
-                        values = tensor[batch_idx, time_idx, sel_v, sel_h, sel_w]
-                        return (values * weights[:, None]).sum(dim=0)
-
-                    mean_center = weighted_mean(center)
-                    mean_offset = weighted_mean(offset)
-                    mean_opacity = weighted_mean(opacity)
-                    mean_scale = weighted_mean(scale)
-                    mean_rotation = F.normalize(weighted_mean(rotation), dim=-1)
-                    mean_feat_dc = weighted_mean(feat_dc)
-                    mean_keep = keep_score[batch_idx, time_idx, sel_v, sel_h, sel_w].max(dim=0).values
-                    mean_instance = weighted_mean(instance_affinity)
-                    mean_motion = weighted_mean(motion_code)
+                    weight_view = weights[:, None]
+                    mean_center = (center_vals * weight_view).sum(dim=0).to(center.dtype)
+                    mean_offset = (offset_vals * weight_view).sum(dim=0).to(offset.dtype)
+                    mean_opacity = (opacity_vals * weight_view).sum(dim=0).to(opacity.dtype)
+                    mean_scale = (scale_vals * weight_view).sum(dim=0).to(scale.dtype)
+                    mean_rotation = F.normalize((rotation_vals * weight_view).sum(dim=0), dim=-1).to(rotation.dtype)
+                    mean_feat_dc = (feat_dc_vals * weight_view).sum(dim=0).to(feat_dc.dtype)
+                    mean_keep = keep_vals.max(dim=0).values.to(keep_score.dtype)
+                    mean_instance = (instance_vals * weight_view).sum(dim=0).to(instance_affinity.dtype)
+                    mean_motion = (motion_vals * weight_view).sum(dim=0).to(motion_code.dtype)
 
                     center[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_center
                     offset[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_offset
@@ -89,21 +95,21 @@ class GaussianMultiViewMerge(nn.Module):
                     instance_affinity[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_instance
                     motion_code[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_motion
 
-                    for dup in range(sel_v.shape[0]):
-                        if dup == rep_idx:
-                            continue
-                        dv = int(sel_v[dup].item())
-                        dh = int(sel_h[dup].item())
-                        dw = int(sel_w[dup].item())
-                        center[batch_idx, time_idx, dv, dh, dw] = mean_center
-                        offset[batch_idx, time_idx, dv, dh, dw] = mean_offset
-                        opacity[batch_idx, time_idx, dv, dh, dw] = mean_opacity * self.duplicate_keep_scale
-                        scale[batch_idx, time_idx, dv, dh, dw] = mean_scale
-                        rotation[batch_idx, time_idx, dv, dh, dw] = mean_rotation
-                        feat_dc[batch_idx, time_idx, dv, dh, dw] = mean_feat_dc
-                        keep_score[batch_idx, time_idx, dv, dh, dw] = mean_keep * self.duplicate_keep_scale
-                        instance_affinity[batch_idx, time_idx, dv, dh, dw] = mean_instance
-                        motion_code[batch_idx, time_idx, dv, dh, dw] = mean_motion
+                    dup_mask = torch.ones_like(sel_v, dtype=torch.bool)
+                    dup_mask[rep_idx] = False
+                    if torch.any(dup_mask):
+                        dup_v = sel_v[dup_mask]
+                        dup_h = sel_h[dup_mask]
+                        dup_w = sel_w[dup_mask]
+                        center[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_center
+                        offset[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_offset
+                        opacity[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_opacity * self.duplicate_keep_scale
+                        scale[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_scale
+                        rotation[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_rotation
+                        feat_dc[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_feat_dc
+                        keep_score[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_keep * self.duplicate_keep_scale
+                        instance_affinity[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_instance
+                        motion_code[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_motion
 
         return GaussianOutput(
             center=center,

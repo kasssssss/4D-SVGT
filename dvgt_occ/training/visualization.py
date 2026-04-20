@@ -146,20 +146,35 @@ def save_training_visualization(
     points_conf = batch["points_conf"][sample_idx, frame_idx].detach().cpu().float().numpy()
     gt_scene_xyz = _subsample_points(points, points_conf, max_points=max_scene_points, quantile=75.0)
 
-    gaussians = outputs["gaussians"]
-    pred_center = gaussians.center[sample_idx, frame_idx].detach().cpu().float().numpy()
-    pred_opacity = gaussians.opacity[sample_idx, frame_idx].detach().cpu().float().numpy().squeeze(-1)
-    pred_scene_xyz = _subsample_points(pred_center, pred_opacity, max_points=max_scene_points, quantile=50.0)
+    gaussians = outputs.get("gaussians")
+    if gaussians is not None:
+        pred_center = gaussians.center[sample_idx, frame_idx].detach().cpu().float().numpy()
+        pred_opacity = gaussians.opacity[sample_idx, frame_idx].detach().cpu().float().numpy().squeeze(-1)
+        pred_scene_xyz = _subsample_points(pred_center, pred_opacity, max_points=max_scene_points, quantile=50.0)
+    else:
+        pred_scene_xyz = np.zeros((0, 3), dtype=np.float32)
 
-    occ_prob = torch.sigmoid(outputs["occ"].occ_logit[sample_idx, frame_idx, 0]).detach().cpu().float().numpy()
-    occ_bev = occ_prob.max(axis=0)
-    occ_gt = batch["occ_label"][sample_idx, frame_idx].detach().cpu().float().numpy()
-    occ_gt_bev = occ_gt.max(axis=0)
+    occ_out = outputs.get("occ")
+    if occ_out is not None:
+        occ_prob = torch.sigmoid(occ_out.occ_logit[sample_idx, frame_idx, 0]).detach().cpu().float().numpy()
+        occ_bev = occ_prob.max(axis=0)
+        occ_gt = batch["occ_label"][sample_idx, frame_idx].detach().cpu().float().numpy()
+        occ_gt_bev = occ_gt.max(axis=0)
+    else:
+        occ_bev = np.zeros((config.occ_grid.y_bins, config.occ_grid.x_bins), dtype=np.float32)
+        occ_gt_bev = np.zeros_like(occ_bev)
 
-    pred_dyn = outputs["render"].render_alpha_dynamic[sample_idx, frame_idx, view_idx, 0].detach().cpu().float().numpy()
+    render_out = outputs.get("render")
+    if render_out is not None and render_out.render_alpha_dynamic is not None:
+        pred_dyn = render_out.render_alpha_dynamic[sample_idx, frame_idx, view_idx, 0].detach().cpu().float().numpy()
+    else:
+        pred_dyn = np.zeros((config.image_height, config.image_width), dtype=np.float32)
     gt_dyn = batch["sam3_dyn_mask_full"][sample_idx, frame_idx, view_idx].detach().cpu().float().numpy()
 
-    sem_logits = outputs["render"].sem_proj_2d[sample_idx, frame_idx, view_idx].detach().cpu().float().numpy()
+    if render_out is not None and render_out.sem_proj_2d is not None:
+        sem_logits = render_out.sem_proj_2d[sample_idx, frame_idx, view_idx].detach().cpu().float().numpy()
+    else:
+        sem_logits = np.zeros((config.projected_semantic_classes, config.image_height, config.image_width), dtype=np.float32)
 
     image_path = _resolve_image_path(batch, sample_idx=sample_idx, frame_idx=frame_idx, view_idx=view_idx)
     if image_path is not None and image_path.exists():
@@ -173,7 +188,16 @@ def save_training_visualization(
     y_range = config.occ_grid.y_range
     extent = [x_range[0], x_range[1], y_range[0], y_range[1]]
 
-    pred_rgb = outputs["render"].render_rgb_all[sample_idx, frame_idx, view_idx].detach().cpu().float().numpy()
+    if render_out is not None:
+        pred_rgb_tensor = render_out.render_rgb_all_composited
+        if pred_rgb_tensor is None:
+            pred_rgb_tensor = render_out.render_rgb_all
+        if pred_rgb_tensor is not None:
+            pred_rgb = pred_rgb_tensor[sample_idx, frame_idx, view_idx].detach().cpu().float().numpy()
+        else:
+            pred_rgb = np.zeros((3, config.image_height, config.image_width), dtype=np.float32)
+    else:
+        pred_rgb = np.zeros((3, config.image_height, config.image_width), dtype=np.float32)
 
     fig, axes = plt.subplots(2, 3, figsize=(19, 10), constrained_layout=True)
     _scatter_bev(axes[0, 0], gt_scene_xyz, x_range, y_range, "GT Scene Proxy (DVGT metric points)")
