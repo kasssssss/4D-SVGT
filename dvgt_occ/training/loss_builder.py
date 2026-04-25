@@ -134,6 +134,8 @@ class DVGTOccLossBuilder(nn.Module):
             losses["dyn_occ"] = self._loss_dyn_occ(outputs, batch)
         if self.weights.gs_render > 0.0 and outputs.get("render") is not None:
             losses["gs_render"] = self._loss_gs_render(outputs, batch)
+        if self.weights.sky_alpha > 0.0 and outputs.get("render") is not None:
+            losses["sky_alpha"] = self._loss_sky_alpha(outputs, batch)
         if self.weights.inst_contrast > 0.0 and outputs.get("entities") is not None:
             losses["inst_contrast"] = self._loss_instance_contrast(outputs, batch)
         if any(weight > 0.0 for weight in (self.weights.query2gs, self.weights.q2gs_null)) and outputs.get("assignment") is not None:
@@ -165,6 +167,8 @@ class DVGTOccLossBuilder(nn.Module):
 
     def _loss_dyn_mask_full(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         if "sam3_dyn_mask_full" in batch and "render" in outputs:
+            train_mode = str(batch.get("_train_mode", "v1-stable"))
+            mask_all_weight = float(batch.get("_mask_all_weight", 0.0))
             pred_dyn = _safe_logit(outputs["render"].render_alpha_dynamic.squeeze(3))
             target_dyn = batch["sam3_dyn_mask_full"]
             valid = batch.get("sam3_valid_mask_full")
@@ -172,13 +176,15 @@ class DVGTOccLossBuilder(nn.Module):
                 loss_dyn = _masked_balanced_bce_with_logits(pred_dyn, target_dyn, valid) + _masked_soft_dice_loss_from_logits(pred_dyn, target_dyn, valid)
             else:
                 loss_dyn = _balanced_bce_with_logits(pred_dyn, target_dyn) + _soft_dice_loss_from_logits(pred_dyn, target_dyn)
+            if train_mode == "v1-stable" or mask_all_weight <= 0.0:
+                return loss_dyn
             pred_all = _safe_logit(outputs["render"].render_alpha_all.squeeze(3))
             target_all = batch.get("sam3_all_mask_full", target_dyn)
             if valid is not None:
                 loss_all = _masked_balanced_bce_with_logits(pred_all, target_all, valid) + _masked_soft_dice_loss_from_logits(pred_all, target_all, valid)
             else:
                 loss_all = _balanced_bce_with_logits(pred_all, target_all) + _soft_dice_loss_from_logits(pred_all, target_all)
-            return loss_dyn + 0.25 * loss_all
+            return loss_dyn + mask_all_weight * loss_all
 
         pred = outputs["dynamic"].dyn_logit_full.squeeze(3)
         target = batch["dyn_soft_mask_1_4"]
@@ -192,16 +198,23 @@ class DVGTOccLossBuilder(nn.Module):
         return _balanced_bce_with_logits(pred, target_full) + _soft_dice_loss_from_logits(pred, target_full)
 
     def _loss_gs_render(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        if "render" not in outputs or "rgb_target" not in batch or "points_conf" not in batch:
+        if "render" not in outputs or "rgb_target" not in batch:
             return _zero_like(outputs["dynamic"].dyn_logit_1_4)
 
-        train_mode = str(batch.get("_train_mode", "v1-stable"))
         pred = outputs["render"].render_rgb_all
-        if train_mode == "v1-sky-ablation" and outputs["render"].render_rgb_all_composited is not None:
+        if outputs["render"].render_rgb_all_composited is not None:
             pred = outputs["render"].render_rgb_all_composited
         target = batch["rgb_target"]
-        conf = batch["points_conf"]
-        valid = self._build_render_valid_mask(conf)
+
+        valid = torch.ones_like(pred[:, :, :, :1])
+        target_is_source = batch.get("target_is_source")
+        if target_is_source is not None:
+            source_weight = float(getattr(self.config, "render_source_weight", 1.0))
+            heldout_weight = float(getattr(self.config, "render_heldout_weight", 0.1))
+            source_mask = target_is_source[:, None, :, None, None, None].to(dtype=valid.dtype, device=valid.device)
+            view_weight = source_mask * source_weight + (1.0 - source_mask) * heldout_weight
+            valid = valid * view_weight
+
         valid_sum = valid.sum().clamp_min(1.0)
         l1 = ((pred - target).abs() * valid).sum() / valid_sum
 
@@ -210,7 +223,31 @@ class DVGTOccLossBuilder(nn.Module):
         else:
             lpips_loss = self._multiscale_l1(pred, target, valid)
         lpips_weight = 0.05 * min(float(self._current_step_hint(outputs, batch)) / 1000.0, 1.0)
-        return l1 + lpips_weight * lpips_loss
+        gs_conf_loss = _zero_like(l1)
+        scale_reg = _zero_like(l1)
+        color_sup = _zero_like(l1)
+        gaussians = outputs.get("gaussians")
+        if gaussians is not None:
+            scale_reg = torch.mean(torch.relu(gaussians.scale - 0.30))
+            feat_dc = gaussians.feat_dc
+            b_g, t_g, v_g, h_g, w_g, _ = feat_dc.shape
+            gt_rgb = batch.get("source_rgb", batch.get("rgb_source", batch["rgb_target"]))
+            if gt_rgb.shape[:3] == feat_dc.shape[:3]:
+                gt_down = torch.nn.functional.interpolate(
+                    gt_rgb.reshape(b_g * t_g * v_g, 3, gt_rgb.shape[-2], gt_rgb.shape[-1]),
+                    size=(h_g, w_g), mode="bilinear", align_corners=False,
+                ).reshape(b_g, t_g, v_g, 3, h_g, w_g).permute(0, 1, 2, 4, 5, 3)
+                color_sup = (feat_dc - gt_down).abs().mean()
+        return l1 + lpips_weight * lpips_loss + 0.01 * gs_conf_loss + 0.1 * scale_reg + 1.0 * color_sup
+
+    def _loss_sky_alpha(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        sky_mask = batch.get("sky_mask_full")
+        if sky_mask is None:
+            return _zero_like(outputs["dynamic"].dyn_logit_1_4)
+        pred = outputs["render"].render_alpha_all.squeeze(3)
+        sky = sky_mask.float()
+        denom = sky.sum().clamp_min(1.0)
+        return (pred * sky).sum() / denom
 
     def _loss_occ(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         pred = outputs["occ"].occ_logit.squeeze(2)
@@ -366,8 +403,15 @@ class DVGTOccLossBuilder(nn.Module):
 
         fg_loss = _zero_like(assignment.assignment_prob)
         if torch.any(fg_mask):
-            fg_prob = assignment.assignment_prob[..., 1:].gather(-1, target_slot.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-            fg_loss = -torch.log(fg_prob[fg_mask].clamp_min(1e-6)).mean()
+            fg_bank = assignment.assignment_prob[..., 1:]
+            if fg_bank.shape[-1] == 0:
+                return fg_loss, _zero_like(assignment.assignment_prob)
+            safe_slot = target_slot.clamp(min=0)
+            valid_slot = safe_slot < fg_bank.shape[-1]
+            active_fg = fg_mask & valid_slot
+            if torch.any(active_fg):
+                fg_prob = fg_bank.gather(-1, safe_slot.clamp(max=fg_bank.shape[-1] - 1).unsqueeze(-1)).squeeze(-1)
+                fg_loss = -torch.log(fg_prob[active_fg].clamp_min(1e-6)).mean()
 
         bg_loss = _zero_like(assignment.assignment_prob)
         if torch.any(bg_mask):
@@ -411,7 +455,26 @@ class DVGTOccLossBuilder(nn.Module):
 
     def _build_render_valid_mask(self, points_conf: torch.Tensor, threshold: float = 0.30, dilate_px: int = 5) -> torch.Tensor:
         b, t, v, h, w = points_conf.shape
-        mask = (points_conf > threshold).float().reshape(b * t * v, 1, h, w)
+        conf = points_conf.float().reshape(b * t * v, h * w)
+
+        # DGGT-style point/depth confidence is not guaranteed to be a 0..1
+        # probability map. In practice our cached points_conf often comes from an
+        # expp1-style head and lives on a >1 scale, so a raw `> 0.30` threshold
+        # collapses into an all-ones valid mask. Normalize each frame-view
+        # robustly before applying the stable-contract threshold.
+        q05 = torch.quantile(conf, 0.05, dim=1, keepdim=True)
+        q95 = torch.quantile(conf, 0.95, dim=1, keepdim=True)
+        denom = (q95 - q05).clamp_min(1e-6)
+        conf_norm = ((conf - q05) / denom).clamp(0.0, 1.0)
+
+        # If a map is already probability-like and spread is tiny, keep it
+        # directly instead of turning the whole frame valid.
+        raw_min = conf.min(dim=1, keepdim=True).values
+        raw_max = conf.max(dim=1, keepdim=True).values
+        looks_prob = (raw_min >= 0.0) & (raw_max <= 1.0 + 1e-4)
+        conf_for_mask = torch.where(looks_prob, conf.clamp(0.0, 1.0), conf_norm)
+
+        mask = (conf_for_mask > threshold).float().reshape(b * t * v, 1, h, w)
         if dilate_px > 0:
             kernel = dilate_px * 2 + 1
             mask = F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=dilate_px)

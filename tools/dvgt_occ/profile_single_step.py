@@ -13,6 +13,7 @@ import yaml
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import sitecustomize  # noqa: F401  # Ensure gsplat compat patch loads before model import.
 
 from dvgt_occ import DVGTOccConfig
 from dvgt_occ.data import DVGTOccClipDataset
@@ -50,6 +51,7 @@ def main() -> None:
     args = parse_args()
     cfg = load_cfg(args.config)
     data_cfg = cfg["data"]
+    train_cfg = cfg.get("train", {})
     model_cfg = DVGTOccConfig(**cfg["model"])
     device = torch.device(args.device)
 
@@ -72,10 +74,14 @@ def main() -> None:
     batch = collate_dvgt_occ_batch([dataset[0]])
     base_weights, _, _ = build_loss_weights(cfg)
     batch["_active_loss_weights"] = base_weights.to_dict()
+    batch["_train_mode"] = str(train_cfg.get("train_mode", "v1-stable"))
+    batch["_mask_all_weight"] = float(train_cfg.get("mask_all_weight", 0.0))
     batch["_profile_timing"] = True
     batch = move_batch_to_device(batch, device)
 
     model = DVGTOccModel(config=model_cfg).to(device)
+    if hasattr(model, "set_train_target"):
+        model.set_train_target(str(train_cfg.get("train_target", "joint")))
     model.train()
     if hasattr(model, "configure_optional_modules"):
         model.configure_optional_modules(batch["_active_loss_weights"])

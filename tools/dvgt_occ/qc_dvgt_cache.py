@@ -44,6 +44,7 @@ def _load_cache(cache_dir: Path, config) -> dict[str, np.ndarray]:
         "points": np.load(cache_dir / "points.npy", allow_pickle=False),
         "points_conf": np.load(cache_dir / "points_conf.npy", allow_pickle=False),
         "ego_pose": np.load(cache_dir / "ego_pose.npy", allow_pickle=False),
+        "raw_patch_tokens": np.load(cache_dir / "raw_patch_tokens.npy", allow_pickle=False),
     }
     for layer in config.selected_layers:
         arrays[f"feat_l{layer}"] = np.load(cache_dir / f"feat_l{layer}.npy", allow_pickle=False)
@@ -161,7 +162,7 @@ def main() -> None:
         enabled=(amp_dtype != torch.float32 and torch.device(device).type == "cuda"),
         dtype=amp_dtype,
     ):
-        aggregated_tokens_list, patch_start_idx, _ = model.aggregator(images)
+        aggregated_tokens_list, patch_start_idx, _, raw_patch_tokens = model.aggregator(images, return_patch_tokens=True)
         points, points_conf = model.point_head(
             aggregated_tokens_list,
             images=images,
@@ -172,6 +173,7 @@ def main() -> None:
     rerun = {
         "points": points.squeeze(0).detach().cpu().float().numpy().astype(np.float32),
         "points_conf": points_conf.squeeze(0).detach().cpu().float().numpy().astype(np.float32),
+        "raw_patch_tokens": raw_patch_tokens.squeeze(0).detach().cpu().to(torch.float16).numpy(),
     }
     for layer in config.selected_layers:
         rerun[f"feat_l{layer}"] = aggregated_tokens_list[layer].squeeze(0).detach().cpu().to(torch.float16).numpy()
@@ -205,6 +207,7 @@ def main() -> None:
     }
     for layer in config.selected_layers:
         summary["comparisons"][f"feat_l{layer}"] = _compare_arrays(rerun[f"feat_l{layer}"], cached[f"feat_l{layer}"])
+    summary["comparisons"]["raw_patch_tokens"] = _compare_arrays(rerun["raw_patch_tokens"], cached["raw_patch_tokens"])
 
     xyz_raw, conf_values_raw, view_idx_raw = _flatten_points(
         cached["points"],

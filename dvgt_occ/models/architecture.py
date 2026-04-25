@@ -21,7 +21,7 @@ from dvgt_occ.models.projection import OccSemanticProjector
 from dvgt_occ.models.reassembly import TokenReassembly
 from dvgt_occ.models.rendering import GaussianMaskRenderer
 from dvgt_occ.models.sky import SkyRayBackground
-from dvgt_occ.types import BridgeOutput, EntityOutput, GaussianAssignmentOutput, SkyOutput
+from dvgt_occ.types import BridgeOutput, DynamicDenseOutput, EntityOutput, GaussianAssignmentOutput, SkyOutput
 
 
 class DVGTOccModel(nn.Module):
@@ -30,7 +30,13 @@ class DVGTOccModel(nn.Module):
         self.config = config
         self.reassembly = TokenReassembly(
             selected_layers=config.selected_layers,
-            in_dim=config.agg_token_dim,
+            in_dim=config.joint_token_dim,
+            out_dim=config.neck_dim,
+            patch_grid=config.patch_grid,
+        )
+        self.gs_reassembly = TokenReassembly(
+            selected_layers=config.selected_layers,
+            in_dim=config.joint_token_dim,
             out_dim=config.neck_dim,
             patch_grid=config.patch_grid,
         )
@@ -38,6 +44,9 @@ class DVGTOccModel(nn.Module):
         self.occ_head = OccHead(
             channels=config.neck_dim,
             semantic_classes=config.semantic_classes,
+            dynamic_channels=config.dynamic_dense_dim,
+            lift_channels=config.occ_lift_dim,
+            bottleneck_channels=config.occ_bottleneck_dim,
             occ_shape_zyx=config.occ_grid.shape_zyx,
             x_range=config.occ_grid.x_range,
             y_range=config.occ_grid.y_range,
@@ -50,7 +59,7 @@ class DVGTOccModel(nn.Module):
             new_queries=config.new_queries,
             dynamic_classes=config.dynamic_classes,
             motion_dim=7,
-            local_feature_dim=config.neck_dim,
+            local_feature_dim=config.dynamic_dense_dim,
             local_topk=min(config.sparse_dynamic_anchors, config.num_views * 56 * 112),
             occ_samples_per_scale=config.occ_samples_per_scale,
             x_range=config.occ_grid.x_range,
@@ -59,6 +68,7 @@ class DVGTOccModel(nn.Module):
         )
         self.gs_head = GSHead(
             channels=config.neck_dim,
+            feature_dim=config.gs_feature_dim,
             instance_dim=config.instance_dim,
             motion_dim=config.motion_dim,
             bias_scale=config.gs_bias_scale,
@@ -69,7 +79,7 @@ class DVGTOccModel(nn.Module):
             gaussian_feat_dim=config.instance_dim + config.motion_dim,
         )
         self.gs_occ_local_bridge = GSOccLocalBridge(
-            occ_channels=config.neck_dim,
+            occ_channels=config.occ_base_dim,
             gs_channels=config.instance_dim + config.motion_dim,
             grid_min_xyz=(config.occ_grid.x_range[0], config.occ_grid.y_range[0], config.occ_grid.z_range[0]),
             voxel_size=config.occ_grid.voxel_size,
@@ -77,6 +87,7 @@ class DVGTOccModel(nn.Module):
         )
         self.gs_occ_global_latent_bridge = GSOccGlobalLatentBridge(channels=config.neck_dim, num_latents=config.global_latents)
         self.gs_token_proj = nn.Linear(config.instance_dim + config.motion_dim, config.neck_dim)
+        self.occ_latent_proj = nn.Linear(config.occ_bottleneck_dim, config.neck_dim)
         self.global_bridge_to_entity = nn.Linear(config.neck_dim, config.instance_dim + config.motion_dim)
         self.entity_aggregator = EntityAggregator(
             instance_dim=config.instance_dim,
@@ -117,6 +128,7 @@ class DVGTOccModel(nn.Module):
         active_loss_weights = batch.get("_active_loss_weights")
         profile_timing = bool(batch.get("_profile_timing", False))
         timings_ms: dict[str, float] = {}
+        train_mode = str(batch.get("_train_mode", "v1-stable"))
 
         def _record_timing(name: str, fn):
             if not profile_timing:
@@ -137,22 +149,50 @@ class DVGTOccModel(nn.Module):
 
         optimize_for_training = isinstance(active_loss_weights, dict)
         render_full_branches = not optimize_for_training
+        use_gs_aux = self.train_target == "gs_only" and train_mode == "v1-gs-aux"
+        need_features = self.train_target in ("occ_only", "joint") or use_gs_aux
+        need_gs_features = self.train_target in ("gs_only", "joint")
 
-        with torch.autograd.profiler.record_function("dvgt_occ/reassembly"):
-            features = _record_timing("reassembly", lambda: self.reassembly(batch["aggregated_tokens"]))
         points = batch["points"]
         points_conf = batch["points_conf"]
         xyz_1_4 = self._downsample_points(points, size=(56, 112))
         conf_1_4 = self._downsample_conf(points_conf, size=(56, 112))
         xyz_1_8 = self._downsample_points(points, size=(28, 56))
-        with torch.autograd.profiler.record_function("dvgt_occ/dynamic_dense"):
-            dynamic = _record_timing(
-                "dynamic_dense",
-                lambda: self.dynamic_dense(features, xyz_1_4=xyz_1_4, conf_1_4=conf_1_4),
-            )
+        conf_1_8 = self._downsample_conf(points_conf, size=(28, 56))
+        rgb_for_gs = batch.get("source_rgb", batch.get("rgb_source", batch.get("rgb_target")))
+        if rgb_for_gs is not None:
+            b_r, t_r, v_r, c_r, h_r, w_r = rgb_for_gs.shape
+            rgb_1_4 = F.interpolate(
+                rgb_for_gs.reshape(b_r * t_r * v_r, c_r, h_r, w_r),
+                size=(56, 112), mode="bilinear", align_corners=False,
+            ).reshape(b_r, t_r, v_r, c_r, 56, 112)
+        else:
+            rgb_1_4 = None
+        features = None
+        if need_features:
+            with torch.autograd.profiler.record_function("dvgt_occ/reassembly"):
+                features = _record_timing(
+                    "reassembly",
+                    lambda: self.reassembly(batch["aggregated_tokens"], batch["raw_patch_tokens"]),
+                )
+        gs_features = None
+        if need_gs_features:
+            with torch.autograd.profiler.record_function("dvgt_occ/gs_reassembly"):
+                gs_features = _record_timing(
+                    "gs_reassembly",
+                    lambda: self.gs_reassembly(batch["aggregated_tokens"], batch["raw_patch_tokens"]),
+                )
+        if need_features:
+            with torch.autograd.profiler.record_function("dvgt_occ/dynamic_dense"):
+                dynamic = _record_timing(
+                    "dynamic_dense",
+                    lambda: self.dynamic_dense(features, xyz_1_4=xyz_1_4, conf_1_4=conf_1_4),
+                )
+        else:
+            dynamic = self._build_dummy_dynamic(xyz_1_4=xyz_1_4, dtype=xyz_1_4.dtype)
         if self.train_target == "occ_only":
             with torch.autograd.profiler.record_function("dvgt_occ/occ_head"):
-                occ = _record_timing("occ_head", lambda: self.occ_head(features, dynamic=dynamic, points=points, points_conf=points_conf))
+                occ = _record_timing("occ_head", lambda: self.occ_head(features, dynamic=dynamic, xyz_1_4=xyz_1_4, conf_1_4=conf_1_4))
             outputs = {
                 "dynamic": dynamic,
                 "occ": occ,
@@ -166,7 +206,16 @@ class DVGTOccModel(nn.Module):
 
         if self.train_target == "gs_only":
             with torch.autograd.profiler.record_function("dvgt_occ/gs_head"):
-                gaussians = _record_timing("gs_head", lambda: self.gs_head(features, dynamic=dynamic, xyz_1_8=xyz_1_8))
+                gaussians = _record_timing(
+                    "gs_head",
+                    lambda: self.gs_head(
+                        gs_features,
+                        dynamic=dynamic if use_gs_aux else None,
+                        xyz_1_4=xyz_1_4,
+                        conf_1_4=conf_1_4,
+                        rgb_1_4=rgb_1_4,
+                    ),
+                )
             with torch.autograd.profiler.record_function("dvgt_occ/gaussian_merge"):
                 gaussians_merged = _record_timing("gaussian_merge", lambda: self.gaussian_merge(gaussians, global_track_id=None))
             dummy_assignment = self._build_dummy_assignment(gaussians_merged)
@@ -205,7 +254,7 @@ class DVGTOccModel(nn.Module):
             return outputs
 
         with torch.autograd.profiler.record_function("dvgt_occ/occ_head"):
-            occ = _record_timing("occ_head", lambda: self.occ_head(features, dynamic=dynamic, points=points, points_conf=points_conf))
+            occ = _record_timing("occ_head", lambda: self.occ_head(features, dynamic=dynamic, xyz_1_4=xyz_1_4, conf_1_4=conf_1_4))
         with torch.autograd.profiler.record_function("dvgt_occ/dynamic_query"):
             queries = _record_timing(
                 "dynamic_query",
@@ -218,8 +267,8 @@ class DVGTOccModel(nn.Module):
                 ),
             )
         with torch.autograd.profiler.record_function("dvgt_occ/gs_head"):
-            gaussians = _record_timing("gs_head", lambda: self.gs_head(features, dynamic=dynamic, xyz_1_8=xyz_1_8))
-        global_track_id = batch.get("gs_global_track_id_1_8")
+            gaussians = _record_timing("gs_head", lambda: self.gs_head(gs_features, dynamic=dynamic, xyz_1_4=xyz_1_4, conf_1_4=conf_1_4, rgb_1_4=rgb_1_4))
+        global_track_id = batch.get("gs_global_track_id_1_4")
         with torch.autograd.profiler.record_function("dvgt_occ/gaussian_merge"):
             gaussians_merged = _record_timing("gaussian_merge", lambda: self.gaussian_merge(gaussians, global_track_id=global_track_id))
         with torch.autograd.profiler.record_function("dvgt_occ/query_assignment"):
@@ -278,6 +327,11 @@ class DVGTOccModel(nn.Module):
         return outputs
 
     def _run_sky_model(self, batch: dict) -> SkyOutput | None:
+        train_mode = str(batch.get("_train_mode", "v1-stable"))
+        active_loss_weights = batch.get("_active_loss_weights", {})
+        sky_alpha_active = isinstance(active_loss_weights, dict) and float(active_loss_weights.get("sky_alpha", 0.0)) > 0.0
+        if train_mode != "v1-sky-ablation" and self.train_target != "sky_only" and not sky_alpha_active:
+            return None
         camera_intrinsics = batch.get("camera_intrinsics")
         camera_to_world = batch.get("camera_to_world")
         if camera_intrinsics is None or camera_to_world is None:
@@ -311,11 +365,38 @@ class DVGTOccModel(nn.Module):
             occ.occ_volumes["occ_1"].reshape(bt, occ.occ_volumes["occ_1"].shape[2], *occ.occ_volumes["occ_1"].shape[-3:]),
             (min(self.config.occ_grid.shape_zyx[0], 4), 10, 10),
         ).flatten(2).transpose(1, 2)
+        occ_tokens = self.occ_latent_proj(occ_tokens)
         global_latents = self.gs_occ_global_latent_bridge(gs_tokens, occ_tokens).reshape(b, t, self.config.global_latents, -1)
         return BridgeOutput(
             gs_to_occ_local=gs_to_occ_local,
             occ_to_gs_local=occ_to_gs_local,
             global_latents=global_latents,
+        )
+
+    def _build_dummy_dynamic(self, xyz_1_4: torch.Tensor, dtype: torch.dtype) -> DynamicDenseOutput:
+        b, t, v, _, h4, w4 = xyz_1_4.shape
+        device = xyz_1_4.device
+        dyn_logit_1_4 = torch.zeros((b, t, v, 1, h4, w4), device=device, dtype=dtype)
+        dyn_logit_full = torch.zeros(
+            (b, t, v, 1, self.config.image_height, self.config.image_width),
+            device=device,
+            dtype=dtype,
+        )
+        dyn_feat_1_4 = torch.zeros((b, t, v, self.config.dynamic_dense_dim, h4, w4), device=device, dtype=dtype)
+        h2 = torch.zeros((b, t, v, self.config.neck_dim, h4, w4), device=device, dtype=dtype)
+        p2 = torch.zeros_like(h2)
+        full = torch.zeros(
+            (b, t, v, self.config.full_dim, self.config.image_height, self.config.image_width),
+            device=device,
+            dtype=dtype,
+        )
+        return DynamicDenseOutput(
+            dyn_logit_1_4=dyn_logit_1_4,
+            dyn_logit_full=dyn_logit_full,
+            dyn_feat_1_4=dyn_feat_1_4,
+            h2=h2,
+            p2=p2,
+            full=full,
         )
 
     def _inject_bridge_context(self, entities: EntityOutput, bridges: BridgeOutput) -> EntityOutput:

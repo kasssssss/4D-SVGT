@@ -8,11 +8,20 @@ import torch.nn.functional as F
 
 
 class MultiScaleDeformable3DAttention(nn.Module):
-    def __init__(self, query_dim: int = 256, samples_per_scale: int = 8, max_scales: int = 3) -> None:
+    def __init__(
+        self,
+        query_dim: int = 256,
+        samples_per_scale: int = 8,
+        max_scales: int = 3,
+        volume_channels: tuple[int, ...] = (64, 128, 128),
+    ) -> None:
         super().__init__()
         self.samples_per_scale = samples_per_scale
         self.offset_heads = nn.ModuleList([nn.Linear(query_dim, samples_per_scale * 3) for _ in range(max_scales)])
         self.weight_heads = nn.ModuleList([nn.Linear(query_dim, samples_per_scale) for _ in range(max_scales)])
+        self.value_projs = nn.ModuleList(
+            [nn.Linear(volume_channels[idx] if idx < len(volume_channels) else query_dim, query_dim) for idx in range(max_scales)]
+        )
         self.out = nn.Sequential(
             nn.LayerNorm(query_dim * max_scales),
             nn.Linear(query_dim * max_scales, query_dim),
@@ -47,6 +56,7 @@ class MultiScaleDeformable3DAttention(nn.Module):
             )
             sampled = sampled.squeeze(-1).permute(0, 2, 3, 1).contiguous()
             sampled = (sampled * weights.unsqueeze(-1)).sum(dim=2)
+            sampled = self.value_projs[scale_idx](sampled)
             sampled_per_scale.append(sampled)
 
         if len(sampled_per_scale) < len(self.offset_heads):

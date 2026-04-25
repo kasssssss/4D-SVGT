@@ -1,9 +1,4 @@
-"""VDA-inspired STH-style dense decoder template.
-
-The temporal block is deliberately lightweight in this scaffold. It keeps the
-shape contract and zero-init residual behavior while leaving room to swap in
-the full Video Depth Anything implementation.
-"""
+"""VDA-style STH dense decoder with temporal attention blocks."""
 
 from __future__ import annotations
 
@@ -12,22 +7,69 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class TemporalModule(nn.Module):
-    def __init__(self, channels: int) -> None:
+class TemporalAttentionBlock(nn.Module):
+    def __init__(self, channels: int, num_heads: int, max_frames: int, mlp_ratio: float = 4.0) -> None:
         super().__init__()
-        self.depthwise = nn.Conv3d(channels, channels, kernel_size=(3, 1, 1), padding=(1, 0, 0), groups=channels)
-        self.pointwise = nn.Conv3d(channels, channels, kernel_size=1)
-        nn.init.zeros_(self.pointwise.weight)
-        nn.init.zeros_(self.pointwise.bias)
+        self.max_frames = int(max_frames)
+        self.norm1 = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(channels, num_heads=num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(channels)
+        hidden_dim = int(channels * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, channels),
+        )
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_frames, channels))
+        nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
+        nn.init.zeros_(self.attn.out_proj.weight)
+        nn.init.zeros_(self.attn.out_proj.bias)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"Expected [N,T,C], got {tuple(x.shape)}")
+        _, t, _ = x.shape
+        if t > self.max_frames:
+            raise ValueError(f"Temporal length {t} exceeds max_frames={self.max_frames}")
+        pos = self.pos_embed[:, :t, :].to(dtype=x.dtype, device=x.device)
+        h = self.norm1(x + pos)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class TemporalModule(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 8,
+        num_attention_blocks: int = 2,
+        max_frames: int = 32,
+    ) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [
+                TemporalAttentionBlock(
+                    channels=channels,
+                    num_heads=num_heads,
+                    max_frames=max_frames,
+                )
+                for _ in range(num_attention_blocks)
+            ]
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 6:
             raise ValueError(f"Expected [B,T,V,C,H,W], got {tuple(x.shape)}")
         b, t, v, c, h, w = x.shape
-        y = x.permute(0, 2, 3, 1, 4, 5).reshape(b * v, c, t, h, w)
-        y = self.pointwise(self.depthwise(y))
-        y = y.reshape(b, v, c, t, h, w).permute(0, 3, 1, 2, 4, 5).contiguous()
-        return x + y
+        y = x.permute(0, 2, 4, 5, 1, 3).reshape(b * v * h * w, t, c)
+        for block in self.blocks:
+            y = block(y)
+        y = y.reshape(b, v, h, w, t, c).permute(0, 4, 1, 5, 2, 3).contiguous()
+        return y
 
 
 class RefineBlock(nn.Module):
@@ -48,12 +90,39 @@ class RefineBlock(nn.Module):
 
 
 class STHStyleDenseDecoder(nn.Module):
-    def __init__(self, channels: int = 256, full_channels: int = 128) -> None:
+    def __init__(
+        self,
+        channels: int = 256,
+        full_channels: int = 128,
+        num_attention_heads: int = 8,
+        num_attention_blocks: int = 2,
+        max_frames: int = 32,
+    ) -> None:
         super().__init__()
-        self.temporal_f3 = TemporalModule(channels)
-        self.temporal_f4 = TemporalModule(channels)
-        self.temporal_path4 = TemporalModule(channels)
-        self.temporal_path3 = TemporalModule(channels)
+        self.temporal_f3 = TemporalModule(
+            channels,
+            num_heads=num_attention_heads,
+            num_attention_blocks=num_attention_blocks,
+            max_frames=max_frames,
+        )
+        self.temporal_f4 = TemporalModule(
+            channels,
+            num_heads=num_attention_heads,
+            num_attention_blocks=num_attention_blocks,
+            max_frames=max_frames,
+        )
+        self.temporal_path4 = TemporalModule(
+            channels,
+            num_heads=num_attention_heads,
+            num_attention_blocks=num_attention_blocks,
+            max_frames=max_frames,
+        )
+        self.temporal_path3 = TemporalModule(
+            channels,
+            num_heads=num_attention_heads,
+            num_attention_blocks=num_attention_blocks,
+            max_frames=max_frames,
+        )
         self.refine4 = RefineBlock(channels)
         self.refine3 = RefineBlock(channels)
         self.refine2 = RefineBlock(channels)

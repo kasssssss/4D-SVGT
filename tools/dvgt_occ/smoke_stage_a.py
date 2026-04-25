@@ -19,6 +19,7 @@ EXPECTED_SHAPES = {
     "points": (8, 6, 224, 448, 3),
     "points_conf": (8, 6, 224, 448),
     "ego_pose": (8, 7),
+    "raw_patch_tokens": (8, 6, 392, 1024),
     "feat_l4": (8, 6, None, 3072),
     "feat_l11": (8, 6, None, 3072),
     "feat_l17": (8, 6, None, 3072),
@@ -41,6 +42,36 @@ EXPECTED_SHAPES = {
     "occ_dyn_label": (8, 10, 100, 100),
 }
 
+STRICT_CACHE_FILES = [
+    "points.npy",
+    "points_conf.npy",
+    "ego_pose.npy",
+    "raw_patch_tokens.npy",
+    "feat_l4.npy",
+    "feat_l11.npy",
+    "feat_l17.npy",
+    "feat_l23.npy",
+]
+
+STRICT_SUPERVISION_FILES = [
+    "dyn_soft_mask_1_4.npy",
+    "gs_local_inst_id_1_8.npy",
+    "gs_global_track_id_1_8.npy",
+    "inst_boundary_weight_1_8.npy",
+    "inst_area_ratio_1_8.npy",
+    "inst_quality_mask_1_8.npy",
+    "track_boxes_3d.npy",
+    "track_cls.npy",
+    "track_id.npy",
+    "track_visible.npy",
+    "track_birth.npy",
+    "track_death.npy",
+    "track_delta_box.npy",
+    "occ_label.npy",
+    "occ_sem_label.npy",
+    "occ_dyn_label.npy",
+]
+
 
 def _check_shape(name: str, array: np.ndarray) -> None:
     expected = EXPECTED_SHAPES.get(name)
@@ -57,9 +88,25 @@ def _check_arrays(group: str, arrays: dict, strict: bool) -> None:
     if strict:
         missing = [name for name in EXPECTED_SHAPES if name not in arrays]
         if group == "cache":
-            missing = [name for name in missing if name.startswith("points") or name.startswith("ego") or name.startswith("feat")]
+            missing = [
+                name
+                for name in missing
+                if name.startswith("points")
+                or name.startswith("ego")
+                or name.startswith("feat")
+                or name == "raw_patch_tokens"
+            ]
         elif group == "supervision":
-            missing = [name for name in missing if not (name.startswith("points") or name.startswith("ego") or name.startswith("feat"))]
+            missing = [
+                name
+                for name in missing
+                if not (
+                    name.startswith("points")
+                    or name.startswith("ego")
+                    or name.startswith("feat")
+                    or name == "raw_patch_tokens"
+                )
+            ]
         if missing:
             raise AssertionError(f"Missing {group} arrays: {missing}")
     for name, array in arrays.items():
@@ -82,6 +129,8 @@ def main() -> None:
         root=args.output_root or args.manifest.parent,
         load_cache=True,
         load_supervision=True,
+        cache_keys=STRICT_CACHE_FILES if args.strict else None,
+        supervision_keys=STRICT_SUPERVISION_FILES if args.strict else None,
         projected_semantic_classes=DEFAULT_DVGT_OCC_CONFIG.projected_semantic_classes,
     )
     end = min(len(dataset), args.index + args.limit)

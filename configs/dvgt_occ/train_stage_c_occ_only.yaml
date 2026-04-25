@@ -51,6 +51,7 @@ train:
   grad_clip: 1.0
   train_target: occ_only
   train_mode: v1-stable
+  mask_all_weight: 0.0
   warmup_iters: 1500
   min_lr: 1.0e-6
   bridge_start_step: 1000000

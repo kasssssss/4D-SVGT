@@ -29,6 +29,7 @@ OUTPUT_FILES = (
     "points.npy",
     "points_conf.npy",
     "ego_pose.npy",
+    "raw_patch_tokens.npy",
     "feat_l4.npy",
     "feat_l11.npy",
     "feat_l17.npy",
@@ -222,7 +223,7 @@ def main() -> None:
             enabled=(amp_dtype != torch.float32 and torch.device(device).type == "cuda"),
             dtype=amp_dtype,
         ):
-            aggregated_tokens_list, patch_start_idx, _ = model.aggregator(images)
+            aggregated_tokens_list, patch_start_idx, _, raw_patch_tokens = model.aggregator(images, return_patch_tokens=True)
             points, points_conf = model.point_head(
                 aggregated_tokens_list,
                 images=images,
@@ -234,6 +235,7 @@ def main() -> None:
         np.save(cache_dir / "points.npy", points_metric)
         np.save(cache_dir / "points_conf.npy", points_conf.squeeze(0).detach().cpu().float().numpy().astype(np.float32))
         np.save(cache_dir / "ego_pose.npy", relative_ego_poses(dirs["source_scene"], entry["frame_ids_10hz"]))
+        np.save(cache_dir / "raw_patch_tokens.npy", raw_patch_tokens.squeeze(0).detach().cpu().to(torch.float16).numpy())
         np.save(cache_dir / "patch_start_idx.npy", np.array([patch_start_idx], dtype=np.int64))
         for layer in config.selected_layers:
             tokens = aggregated_tokens_list[layer].squeeze(0).detach().cpu().to(torch.float16).numpy()
@@ -255,7 +257,7 @@ def main() -> None:
             ),
             encoding="utf-8",
         )
-        del images, aggregated_tokens_list, points, points_conf
+        del images, aggregated_tokens_list, raw_patch_tokens, points, points_conf
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         built += 1

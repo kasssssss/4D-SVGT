@@ -68,10 +68,16 @@ class SkyRayBackground(nn.Module):
         xs = xs + 0.5
         ys = ys + 0.5
 
-        fx = camera_intrinsics[..., 0][..., None, None]
-        fy = camera_intrinsics[..., 1][..., None, None]
-        cx = camera_intrinsics[..., 2][..., None, None]
-        cy = camera_intrinsics[..., 3][..., None, None]
+        intr = camera_intrinsics
+        if intr.dim() == 2:
+            intr = intr.unsqueeze(0)
+        if intr.dim() == 3:
+            intr = intr.unsqueeze(1).expand(-1, camera_to_world.shape[1], -1, -1)
+
+        fx = intr[..., 0][..., None, None]
+        fy = intr[..., 1][..., None, None]
+        cx = intr[..., 2][..., None, None]
+        cy = intr[..., 3][..., None, None]
 
         x_cam = (xs - cx) / fx.clamp_min(1e-6)
         y_cam = (ys - cy) / fy.clamp_min(1e-6)

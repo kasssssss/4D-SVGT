@@ -68,6 +68,7 @@ class DynamicQueryOutput:
 
 @dataclass
 class GaussianOutput:
+    dense_feat: torch.Tensor
     center: torch.Tensor
     offset: torch.Tensor
     opacity: torch.Tensor
@@ -82,6 +83,22 @@ class GaussianOutput:
     @property
     def confidence(self) -> torch.Tensor:
         return self.keep_score
+
+    @property
+    def gs_conf(self) -> torch.Tensor:
+        return self.keep_score
+
+    @property
+    def gs_core_map(self) -> torch.Tensor:
+        return torch.cat(
+            (
+                self.feat_dc,
+                self.opacity,
+                self.scale,
+                self.rotation,
+            ),
+            dim=-1,
+        )
 
 
 @dataclass

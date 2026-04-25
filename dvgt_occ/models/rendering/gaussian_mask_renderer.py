@@ -1,13 +1,18 @@
-"""Camera-aware differentiable Gaussian image renderer."""
+"""DGGT-style Gaussian rasterization renderer backed by gsplat."""
 
 from __future__ import annotations
-
-import itertools
 
 import torch
 import torch.nn as nn
 
 from dvgt_occ.types import GaussianAssignmentOutput, GaussianOutput, RenderOutput
+
+_GSPLAT_IMPORT_ERROR: Exception | None = None
+try:
+    from gsplat.rendering import rasterization
+except ImportError as exc:  # pragma: no cover - runtime dependency in training env
+    rasterization = None
+    _GSPLAT_IMPORT_ERROR = exc
 
 
 class GaussianMaskRenderer(nn.Module):
@@ -15,9 +20,6 @@ class GaussianMaskRenderer(nn.Module):
         super().__init__()
         self.output_size = output_size
         self.splat_radius = max(int(splat_radius), 1)
-        self.radius_scale = 1.5
-        offsets = list(itertools.product(range(-self.splat_radius, self.splat_radius + 1), repeat=2))
-        self.register_buffer('kernel_offsets', torch.tensor(offsets, dtype=torch.long), persistent=False)
 
     def forward(
         self,
@@ -31,8 +33,16 @@ class GaussianMaskRenderer(nn.Module):
         compute_static_branch: bool = True,
         compute_dynamic_rgb: bool = True,
     ) -> RenderOutput:
+        if rasterization is None:
+            detail = f" ({_GSPLAT_IMPORT_ERROR!r})" if _GSPLAT_IMPORT_ERROR is not None else ""
+            raise ImportError(f"gsplat.rendering.rasterization is required for Gaussian rendering{detail}.")
+
         b, t, v, h, w = gaussians.opacity.shape[:5]
         opacity = gaussians.opacity.squeeze(-1)
+        # Mirror DGGT's render contract: gs_conf / keep_score is optimized via a
+        # separate lifespan-style regularizer, not multiplied directly into the
+        # rasterized opacity. Doing the multiplication here made the render path
+        # darker without matching DGGT's training behavior.
         base_alpha = opacity.clamp(0.0, 1.0)
 
         background = assignment.background_prob.reshape(b, t, v, h, w)
@@ -44,6 +54,7 @@ class GaussianMaskRenderer(nn.Module):
         rgb_all, render_alpha_all, sigma_mean, touch_ratio = self._render_branch(
             gaussians.center,
             gaussians.scale,
+            gaussians.rotation,
             gaussians.feat_dc,
             alpha_all,
             camera_intrinsics,
@@ -54,6 +65,7 @@ class GaussianMaskRenderer(nn.Module):
         rgb_dyn, render_alpha_dyn, _, _ = self._render_branch(
             gaussians.center,
             gaussians.scale,
+            gaussians.rotation,
             gaussians.feat_dc,
             alpha_dyn,
             camera_intrinsics,
@@ -65,6 +77,7 @@ class GaussianMaskRenderer(nn.Module):
             rgb_sta, render_alpha_sta, _, _ = self._render_branch(
                 gaussians.center,
                 gaussians.scale,
+                gaussians.rotation,
                 gaussians.feat_dc,
                 alpha_sta,
                 camera_intrinsics,
@@ -91,6 +104,7 @@ class GaussianMaskRenderer(nn.Module):
         self,
         centers: torch.Tensor,
         scales: torch.Tensor,
+        rotations: torch.Tensor,
         colors: torch.Tensor,
         alpha: torch.Tensor,
         camera_intrinsics: torch.Tensor,
@@ -99,150 +113,162 @@ class GaussianMaskRenderer(nn.Module):
         *,
         return_rgb: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        b, t, _, _, _, _ = centers.shape
+        b, t, v, h, w, _ = centers.shape
         height, width = self.output_size
         device = centers.device
-        rgb = torch.zeros((b, t, camera_to_world.shape[2], 3, height, width), device=device, dtype=centers.dtype) if return_rgb else None
-        out_alpha = torch.zeros((b, t, camera_to_world.shape[2], 1, height, width), device=device, dtype=centers.dtype)
-        sigma_total = torch.zeros((), device=device, dtype=centers.dtype)
-        touch_total = torch.zeros((), device=device, dtype=centers.dtype)
-        view_count = torch.zeros((), device=device, dtype=centers.dtype)
+        dtype = centers.dtype
+        num_views = camera_to_world.shape[2]
 
-        centers_flat = centers.reshape(b, t, -1, 3)
-        scales_flat = scales.mean(dim=-1).reshape(b, t, -1)
-        colors_flat = colors.reshape(b, t, -1, 3).clamp(0.0, 1.0)
-        alpha_flat = alpha.reshape(b, t, -1).clamp(0.0, 1.0)
+        out_rgb = torch.zeros((b, t, num_views, 3, height, width), device=device, dtype=dtype)
+        out_alpha = torch.zeros((b, t, num_views, 1, height, width), device=device, dtype=dtype)
+        sigma_total = torch.zeros((), device=device, dtype=torch.float32)
+        touch_total = torch.zeros((), device=device, dtype=torch.float32)
+        view_count = 0
 
-        ones = torch.ones((centers_flat.shape[2], 1), device=device, dtype=centers.dtype)
+        first_rot_quat = self._matrix_to_quaternion(first_ego_pose_world[:, :3, :3].float())
+        n_total = v * h * w
+
         for batch_idx in range(b):
             first_pose = first_ego_pose_world[batch_idx]
             for time_idx in range(t):
-                xyz = centers_flat[batch_idx, time_idx]
-                xyz_h = torch.cat([xyz, ones], dim=-1)
-                world = (first_pose @ xyz_h.t()).t()
-                world_to_cam_all = torch.linalg.inv(camera_to_world[batch_idx, time_idx].float())
-                for view_idx in range(camera_to_world.shape[2]):
-                    rgb_view, alpha_view, sigma_view, touch_view = self._project_and_splat(
-                        world,
-                        scales_flat[batch_idx, time_idx],
-                        colors_flat[batch_idx, time_idx],
-                        alpha_flat[batch_idx, time_idx],
-                        camera_intrinsics[batch_idx, view_idx],
-                        world_to_cam_all[view_idx],
-                        height=height,
+                xyz = centers[batch_idx, time_idx].reshape(-1, 3)
+                ones_v = torch.ones((n_total, 1), device=device, dtype=dtype)
+                xyz_h = torch.cat([xyz, ones_v], dim=-1)
+                means_world = (first_pose @ xyz_h.t()).t()[:, :3].float()
+                quats_world = self._quat_mul(
+                    first_rot_quat[batch_idx].unsqueeze(0).expand(n_total, -1),
+                    rotations[batch_idx, time_idx].reshape(-1, 4).float(),
+                )
+                scales_v = scales[batch_idx, time_idx].reshape(-1, 3).clamp(1e-4, 0.30).float()
+                colors_v = colors[batch_idx, time_idx].reshape(-1, 3).clamp(0.0, 1.0).float()
+                for view_idx in range(num_views):
+                    opacities = alpha[batch_idx, time_idx].reshape(-1).clamp(0.0, 1.0).float()
+
+                    viewmat = torch.linalg.inv(camera_to_world[batch_idx, time_idx, view_idx:view_idx+1].float())
+                    k = self._build_k_mats(camera_intrinsics[batch_idx, view_idx:view_idx+1])
+                    rgb_v, alpha_v, sigma_v, touch_v = self._rasterize_views(
+                        means_world=means_world,
+                        quats_world=quats_world,
+                        scales=scales_v,
+                        opacities=opacities,
+                        colors=colors_v,
+                        viewmats=viewmat,
+                        ks=k,
                         width=width,
+                        height=height,
                         return_rgb=return_rgb,
                     )
-                    if rgb is not None:
-                        rgb[batch_idx, time_idx, view_idx] = rgb_view
-                    out_alpha[batch_idx, time_idx, view_idx, 0] = alpha_view
-                    sigma_total = sigma_total + sigma_view
-                    touch_total = touch_total + touch_view
-                    view_count = view_count + 1.0
-        denom = view_count.clamp_min(1.0)
-        if rgb is None:
-            rgb = torch.zeros((b, t, camera_to_world.shape[2], 3, height, width), device=device, dtype=centers.dtype)
-        return rgb, out_alpha, sigma_total / denom, touch_total / denom
+                    out_rgb[batch_idx, time_idx, view_idx] = rgb_v[0].to(dtype)
+                    out_alpha[batch_idx, time_idx, view_idx] = alpha_v[0].to(dtype)
+                    sigma_total = sigma_total + sigma_v.float()
+                    touch_total = touch_total + touch_v.float()
+                    view_count += 1
 
-    def _project_and_splat(
+        denom = max(view_count, 1)
+        return out_rgb, out_alpha, (sigma_total / denom).to(dtype), (touch_total / denom).to(dtype)
+
+    def _rasterize_views(
         self,
-        world_xyz_h: torch.Tensor,
-        scale: torch.Tensor,
-        color: torch.Tensor,
-        alpha: torch.Tensor,
-        intrinsics: torch.Tensor,
-        world_to_cam: torch.Tensor,
         *,
-        height: int,
+        means_world: torch.Tensor,
+        quats_world: torch.Tensor,
+        scales: torch.Tensor,
+        opacities: torch.Tensor,
+        colors: torch.Tensor,
+        viewmats: torch.Tensor,
+        ks: torch.Tensor,
         width: int,
+        height: int,
         return_rgb: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        device = world_xyz_h.device
-        out_dtype = world_xyz_h.dtype
-        world_xyz_h = world_xyz_h.float()
-        scale = scale.float()
-        color = color.float()
-        alpha = alpha.float()
-        intrinsics = intrinsics.float()
-        world_to_cam = world_to_cam.float()
-        fx, fy, cx, cy = intrinsics
-        cam = (world_to_cam @ world_xyz_h.t()).t()[:, :3]
-        z = cam[:, 2]
-        valid = (z > 1e-3) & torch.isfinite(cam).all(dim=-1) & (alpha > 1e-5)
-        rgb_num = torch.zeros((3, height * width), device=device, dtype=torch.float32) if return_rgb else None
-        alpha_den = torch.zeros((height * width,), device=device, dtype=torch.float32)
-        if not torch.any(valid):
-            zero = torch.zeros((), device=device, dtype=out_dtype)
-            rgb_out = torch.zeros((3, height, width), device=device, dtype=out_dtype)
-            return rgb_out, alpha_den.reshape(height, width).to(out_dtype), zero, zero
-
-        cam = cam[valid]
-        scale = scale[valid]
-        color = color[valid]
-        alpha = alpha[valid]
-        z = z[valid]
-
-        u = cam[:, 0] * fx / z + cx
-        v = cam[:, 1] * fy / z + cy
-        sigma = (((fx + fy) * 0.5) * scale.abs() / z.clamp_min(1e-3)).clamp(0.75, 10.0)
-        valid = (u >= -self.splat_radius - 1.0) & (u <= width + self.splat_radius) & (v >= -self.splat_radius - 1.0) & (v <= height + self.splat_radius)
-        if not torch.any(valid):
-            zero = torch.zeros((), device=device, dtype=out_dtype)
-            rgb_out = torch.zeros((3, height, width), device=device, dtype=out_dtype)
-            return rgb_out, alpha_den.reshape(height, width).to(out_dtype), zero, zero
-
-        u = u[valid]
-        v = v[valid]
-        sigma = sigma[valid]
-        color = color[valid]
-        alpha = alpha[valid]
-        z = z[valid]
-        sigma_mean = sigma.mean().to(out_dtype)
-
-        order = torch.argsort(z, descending=False)
-        u = u[order]
-        v = v[order]
-        sigma = sigma[order]
-        color = color[order]
-        alpha = alpha[order]
-
-        x0 = torch.floor(u).long()
-        y0 = torch.floor(v).long()
-        offsets = self.kernel_offsets.to(device=device)
-        radii = torch.ceil(sigma * self.radius_scale).long().clamp(min=1, max=self.splat_radius)
-        xo_all = x0[:, None] + offsets[None, :, 0]
-        yo_all = y0[:, None] + offsets[None, :, 1]
-        radius_keep = (offsets[None, :, 0].abs() <= radii[:, None]) & (offsets[None, :, 1].abs() <= radii[:, None])
-        bounds_keep = (xo_all >= 0) & (xo_all < width) & (yo_all >= 0) & (yo_all < height)
-        keep_all = radius_keep & bounds_keep
-
-        sigma_safe = sigma.clamp_min(1e-3)
-        du_all = (u[:, None] - xo_all.float()) / sigma_safe[:, None]
-        dv_all = (v[:, None] - yo_all.float()) / sigma_safe[:, None]
-        local_alpha_all = torch.exp(-0.5 * (du_all * du_all + dv_all * dv_all)) * alpha[:, None]
-        local_alpha_all = local_alpha_all.clamp(0.0, 0.999)
-        idx_all = yo_all * width + xo_all
-
-        for point_idx in range(u.shape[0]):
-            keep = keep_all[point_idx]
-            if not torch.any(keep):
-                continue
-            idx = idx_all[point_idx, keep]
-            local_alpha = local_alpha_all[point_idx, keep]
-            transmittance = (1.0 - alpha_den[idx]).clamp(0.0, 1.0)
-            contrib = local_alpha * transmittance
-            alpha_den[idx] = (alpha_den[idx] + contrib).clamp(0.0, 0.999)
-            if rgb_num is not None:
-                rgb_num[:, idx] = rgb_num[:, idx] + color[point_idx].unsqueeze(-1) * contrib.unsqueeze(0)
-
-        if rgb_num is None:
-            rgb = torch.zeros((3, height, width), device=device, dtype=out_dtype)
-        else:
-            rgb = rgb_num.reshape(3, height, width).clamp(0.0, 1.0).to(out_dtype)
-        touch_ratio = (alpha_den > 1e-6).float().mean().to(out_dtype)
-        return (
-            rgb,
-            alpha_den.reshape(height, width).clamp(0.0, 1.0).to(out_dtype),
-            sigma_mean,
-            touch_ratio,
+        device = means_world.device
+        valid = (
+            torch.isfinite(means_world).all(dim=-1)
+            & torch.isfinite(quats_world).all(dim=-1)
+            & torch.isfinite(scales).all(dim=-1)
+            & torch.isfinite(colors).all(dim=-1)
+            & torch.isfinite(opacities)
+            & (opacities > 1e-6)
         )
+        means_h = torch.cat(
+            [means_world.float(), torch.ones((means_world.shape[0], 1), device=device, dtype=torch.float32)],
+            dim=-1,
+        )
+        camera_z = (viewmats[0].float() @ means_h.t()).t()[:, 2]
+        valid = valid & torch.isfinite(camera_z) & (camera_z.abs() > 0.5)
+        if not torch.any(valid):
+            num_views = viewmats.shape[0]
+            zero_rgb = torch.zeros((num_views, 3, height, width), device=device, dtype=means_world.dtype)
+            zero_alpha = torch.zeros((num_views, 1, height, width), device=device, dtype=means_world.dtype)
+            zero = torch.zeros((), device=device, dtype=means_world.dtype)
+            return zero_rgb, zero_alpha, zero, zero
+
+        means = means_world[valid]
+        quats = torch.nn.functional.normalize(quats_world[valid], dim=-1)
+        scl = scales[valid]
+        opa = opacities[valid]
+        cols = colors[valid] if return_rgb else torch.zeros_like(colors[valid])
+
+        renders, alphas, aux = rasterization(
+            means=means,
+            quats=quats,
+            scales=scl,
+            opacities=opa,
+            colors=cols,
+            viewmats=viewmats,
+            Ks=ks,
+            width=width,
+            height=height,
+        )
+        renders = renders.permute(0, 3, 1, 2).contiguous()
+        alphas = alphas.permute(0, 3, 1, 2).contiguous()
+        if not return_rgb:
+            renders.zero_()
+
+        sigma_mean = scl.mean()
+        if isinstance(aux, dict) and "radii" in aux:
+            radii = aux["radii"]
+            if torch.is_tensor(radii) and radii.numel() > 0:
+                sigma_mean = radii.float().mean()
+        touch_ratio = (alphas > 1e-6).float().mean()
+        return renders, alphas, sigma_mean, touch_ratio
+
+    @staticmethod
+    def _build_k_mats(intrinsics: torch.Tensor) -> torch.Tensor:
+        intrinsics = intrinsics.float()
+        fx = intrinsics[:, 0]
+        fy = intrinsics[:, 1]
+        cx = intrinsics[:, 2]
+        cy = intrinsics[:, 3]
+        ks = torch.zeros((intrinsics.shape[0], 3, 3), device=intrinsics.device, dtype=intrinsics.dtype)
+        ks[:, 0, 0] = fx
+        ks[:, 1, 1] = fy
+        ks[:, 0, 2] = cx
+        ks[:, 1, 2] = cy
+        ks[:, 2, 2] = 1.0
+        return ks
+
+    @staticmethod
+    def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        w1, x1, y1, z1 = q1.unbind(dim=-1)
+        w2, x2, y2, z2 = q2.unbind(dim=-1)
+        return torch.stack(
+            (
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ),
+            dim=-1,
+        )
+
+    @staticmethod
+    def _matrix_to_quaternion(rot: torch.Tensor) -> torch.Tensor:
+        m = rot
+        trace = m[..., 0, 0] + m[..., 1, 1] + m[..., 2, 2]
+        qw = torch.sqrt(torch.clamp(trace + 1.0, min=1e-8)) * 0.5
+        qx = (m[..., 2, 1] - m[..., 1, 2]) / (4.0 * qw.clamp_min(1e-8))
+        qy = (m[..., 0, 2] - m[..., 2, 0]) / (4.0 * qw.clamp_min(1e-8))
+        qz = (m[..., 1, 0] - m[..., 0, 1]) / (4.0 * qw.clamp_min(1e-8))
+        quat = torch.stack((qw, qx, qy, qz), dim=-1)
+        return torch.nn.functional.normalize(quat, dim=-1)

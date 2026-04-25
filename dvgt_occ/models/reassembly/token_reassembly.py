@@ -15,7 +15,7 @@ class TokenReassembly(nn.Module):
     def __init__(
         self,
         selected_layers: Sequence[int] = (4, 11, 17, 23),
-        in_dim: int = 3072,
+        in_dim: int = 4096,
         out_dim: int = 256,
         patch_grid: Sequence[int] = (14, 28),
         special_tokens: Optional[int] = None,
@@ -26,13 +26,17 @@ class TokenReassembly(nn.Module):
         self.special_tokens = special_tokens
         self.projections = nn.ModuleDict({str(layer): nn.Conv2d(in_dim, out_dim, 1) for layer in self.selected_layers})
 
-    def forward(self, aggregated_tokens: Mapping[int, torch.Tensor]) -> ReassembledFeatures:
+    def forward(
+        self,
+        aggregated_tokens: Mapping[int, torch.Tensor],
+        raw_patch_tokens: torch.Tensor,
+    ) -> ReassembledFeatures:
         projected = []
         for layer in self.selected_layers:
             if layer not in aggregated_tokens:
                 raise KeyError(f"Missing DVGT layer {layer}; available={list(aggregated_tokens.keys())}")
             tokens = aggregated_tokens[layer]
-            projected.append(self._project(tokens, self.projections[str(layer)]))
+            projected.append(self._project(tokens, raw_patch_tokens, self.projections[str(layer)]))
 
         # The selected DVGT layers are single-scale patch grids. We expose a DPT
         # style pyramid so each downstream head receives the same contract.
@@ -47,9 +51,11 @@ class TokenReassembly(nn.Module):
             f4=self._unflatten(f4, aggregated_tokens[self.selected_layers[0]]),
         )
 
-    def _project(self, tokens: torch.Tensor, projection: nn.Module) -> torch.Tensor:
+    def _project(self, tokens: torch.Tensor, raw_patch_tokens: torch.Tensor, projection: nn.Module) -> torch.Tensor:
         if tokens.ndim != 5:
             raise ValueError(f"Expected tokens [B,T,V,N,C], got {tuple(tokens.shape)}")
+        if raw_patch_tokens.ndim != 5:
+            raise ValueError(f"Expected raw patch tokens [B,T,V,P,C], got {tuple(raw_patch_tokens.shape)}")
         b, t, v, n, c = tokens.shape
         hp, wp = self.patch_grid
         patch_count = hp * wp
@@ -62,7 +68,13 @@ class TokenReassembly(nn.Module):
                 f"Expected {hp * wp} patch tokens after {special_tokens} special tokens, "
                 f"got {patch_tokens.shape[3]}"
             )
-        x = patch_tokens.reshape(b * t * v, hp, wp, c).permute(0, 3, 1, 2).contiguous()
+        if raw_patch_tokens.shape[:4] != (b, t, v, patch_count):
+            raise ValueError(
+                "Raw patch tokens must align with aggregated patch tokens; "
+                f"expected {(b, t, v, patch_count, raw_patch_tokens.shape[-1])}, got {tuple(raw_patch_tokens.shape)}"
+            )
+        joint_tokens = torch.cat([patch_tokens, raw_patch_tokens], dim=-1)
+        x = joint_tokens.reshape(b * t * v, hp, wp, joint_tokens.shape[-1]).permute(0, 3, 1, 2).contiguous()
         return projection(x)
 
     @staticmethod

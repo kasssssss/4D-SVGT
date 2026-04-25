@@ -7,7 +7,51 @@ import torch.nn as nn
 import numpy as np
 import copy
 import math
-from diffusers.schedulers import DDIMScheduler
+from pathlib import Path
+try:
+    from diffusers.schedulers import DDIMScheduler
+except ImportError:  # pragma: no cover - lightweight training containers may not ship diffusers
+    class _DDIMStepOutput:
+        def __init__(self, prev_sample):
+            self.prev_sample = prev_sample
+
+    class DDIMScheduler:
+        def __init__(self, num_train_timesteps=1000, beta_schedule="scaled_linear", prediction_type="sample"):
+            self.num_train_timesteps = int(num_train_timesteps)
+            self.prediction_type = prediction_type
+            if beta_schedule == "scaled_linear":
+                betas = torch.linspace(1e-4 ** 0.5, 2e-2 ** 0.5, self.num_train_timesteps, dtype=torch.float32) ** 2
+            else:
+                betas = torch.linspace(1e-4, 2e-2, self.num_train_timesteps, dtype=torch.float32)
+            alphas = 1.0 - betas
+            self.alphas_cumprod = torch.cumprod(alphas, dim=0)
+            self.timesteps = torch.arange(self.num_train_timesteps - 1, -1, -1, dtype=torch.long)
+            self._step_size = 1
+
+        def add_noise(self, original_samples, noise, timesteps):
+            alphas = self.alphas_cumprod.to(original_samples.device)[timesteps].to(original_samples.dtype)
+            while alphas.ndim < original_samples.ndim:
+                alphas = alphas.unsqueeze(-1)
+            return alphas.sqrt() * original_samples + (1.0 - alphas).sqrt() * noise
+
+        def set_timesteps(self, num_inference_steps, device=None):
+            step = max(self.num_train_timesteps // int(num_inference_steps), 1)
+            self._step_size = step
+            self.timesteps = torch.arange(self.num_train_timesteps - step, -1, -step, dtype=torch.long, device=device)
+
+        def step(self, model_output, timestep, sample):
+            if self.prediction_type != "sample":
+                raise NotImplementedError("Fallback DDIMScheduler only supports prediction_type='sample'.")
+            timestep_value = int(timestep.item() if torch.is_tensor(timestep) else timestep)
+            prev_timestep = max(timestep_value - int(self._step_size), 0)
+            alphas = self.alphas_cumprod.to(sample.device, dtype=sample.dtype)
+            alpha_t = alphas[timestep_value]
+            alpha_prev = alphas[prev_timestep] if prev_timestep >= 0 else sample.new_tensor(1.0)
+            beta_t = (1.0 - alpha_t).clamp_min(1e-12)
+            pred_original_sample = model_output
+            pred_epsilon = (sample - alpha_t.sqrt() * pred_original_sample) / beta_t.sqrt()
+            prev_sample = alpha_prev.sqrt() * pred_original_sample + (1.0 - alpha_prev).sqrt() * pred_epsilon
+            return _DDIMStepOutput(prev_sample=prev_sample)
 
 from dvgt.models.layers.block import CrossAttentionBlock
 
@@ -289,8 +333,11 @@ class TrajectoryPoseDecoder(nn.Module):
         )
 
         # Traj Anchors
-        traj_anchor_data = np.load(traj_anchor_filepath)
-        traj_anchor = torch.from_numpy(traj_anchor_data['centers']).to(torch.float32)     # [N, 8, 2]
+        if Path(traj_anchor_filepath).exists():
+            traj_anchor_data = np.load(traj_anchor_filepath)
+            traj_anchor = torch.from_numpy(traj_anchor_data['centers']).to(torch.float32)     # [N, 8, 2]
+        else:
+            traj_anchor = torch.zeros((20, future_frame_window, 2), dtype=torch.float32)
         traj_anchor = traj_anchor.unsqueeze(0) * gt_scale_factor  # [1, N, 8, 2]
         traj_max = torch.tensor(traj_max, dtype=torch.float32) * gt_scale_factor
         traj_min = torch.tensor(traj_min, dtype=torch.float32) * gt_scale_factor
@@ -305,8 +352,11 @@ class TrajectoryPoseDecoder(nn.Module):
             self.hist_encoding = nn.Linear(8, dim_in)
 
         # Pose Translation Anchors
-        pose_anchor_data = np.load(pose_translation_anchor_filepath)
-        pose_translation_anchor = torch.from_numpy(pose_anchor_data['centers']).to(torch.float32)     # [N, 3]
+        if Path(pose_translation_anchor_filepath).exists():
+            pose_anchor_data = np.load(pose_translation_anchor_filepath)
+            pose_translation_anchor = torch.from_numpy(pose_anchor_data['centers']).to(torch.float32)     # [N, 3]
+        else:
+            pose_translation_anchor = torch.zeros((20, 3), dtype=torch.float32)
         pose_translation_anchor = pose_translation_anchor.unsqueeze(0) * gt_scale_factor  # [1, N, 3]
         pose_translation_max = torch.tensor(pose_translation_max, dtype=torch.float32) * gt_scale_factor
         pose_translation_min = torch.tensor(pose_translation_min, dtype=torch.float32) * gt_scale_factor

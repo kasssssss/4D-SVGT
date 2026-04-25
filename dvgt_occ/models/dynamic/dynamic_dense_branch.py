@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from dvgt_occ.models.decoders import DynamicDenseDecoder
+from dvgt_occ.models.decoders import DynamicDenseDecoder, TemporalModule
 from dvgt_occ.types import DynamicDenseOutput, ReassembledFeatures
 
 
@@ -13,11 +13,18 @@ class DynamicDenseBranch(nn.Module):
         super().__init__()
         self.decoder = DynamicDenseDecoder(channels=channels, full_channels=full_channels)
         self.gradient_checkpointing = False
-        self.head = nn.Sequential(
-            nn.Conv2d(channels + 4, channels, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(channels, 1, 1),
+        self.pre = nn.Sequential(
+            nn.Conv2d(channels + 4, full_channels, 3, padding=1),
+            nn.GroupNorm(8, full_channels),
+            nn.SiLU(),
         )
+        self.temporal = TemporalModule(channels=full_channels, num_heads=8, num_attention_blocks=2)
+        self.post = nn.Sequential(
+            nn.Conv2d(full_channels, full_channels, 3, padding=1),
+            nn.GroupNorm(8, full_channels),
+            nn.SiLU(),
+        )
+        self.head = nn.Conv2d(full_channels, 1, 1)
         self.full_head = nn.Sequential(
             nn.Conv2d(full_channels, full_channels, 3, padding=1),
             nn.GELU(),
@@ -35,13 +42,16 @@ class DynamicDenseBranch(nn.Module):
         b, t, v, c, h, w = p2.shape
         geom = torch.cat([xyz_1_4, conf_1_4], dim=3)
         x = torch.cat([p2, geom], dim=3).reshape(b * t * v, c + 4, h, w)
-        dyn_logit = self.head(x).reshape(b, t, v, 1, h, w)
+        x = self.pre(x).reshape(b, t, v, -1, h, w)
+        x = self.temporal(x)
+        dyn_feat = self.post(x.reshape(b * t * v, -1, h, w)).reshape(b, t, v, -1, h, w)
+        dyn_logit = self.head(dyn_feat.reshape(b * t * v, dyn_feat.shape[3], h, w)).reshape(b, t, v, 1, h, w)
         full_logit = self.full_head(full.reshape(b * t * v, full.shape[3], full.shape[4], full.shape[5]))
         full_logit = full_logit.reshape(b, t, v, 1, full.shape[4], full.shape[5])
         return DynamicDenseOutput(
             dyn_logit_1_4=dyn_logit,
             dyn_logit_full=full_logit,
-            dyn_feat_1_4=p2,
+            dyn_feat_1_4=dyn_feat,
             h2=h2,
             p2=p2,
             full=full,

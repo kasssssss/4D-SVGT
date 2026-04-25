@@ -1,11 +1,36 @@
 import torch
 import torch.nn as nn
 from typing import Dict, Optional
-from iopath.common.file_io import g_pathmgr
+try:
+    from iopath.common.file_io import g_pathmgr
+except ImportError:  # pragma: no cover - lightweight training containers may not ship iopath
+    class _LocalPathManager:
+        @staticmethod
+        def open(path, mode="r", *args, **kwargs):
+            return open(path, mode, *args, **kwargs)
+
+    g_pathmgr = _LocalPathManager()
 from einops import rearrange
 import logging
-from hydra.utils import instantiate
-from safetensors.torch import load_file
+try:
+    from hydra.utils import instantiate
+except ImportError:  # pragma: no cover - lightweight training containers may not ship hydra
+    import importlib
+
+    def instantiate(conf, **kwargs):
+        if conf is None:
+            return None
+        if not isinstance(conf, dict) or "_target_" not in conf:
+            raise ImportError("hydra is unavailable and the fallback instantiate requires a dict with '_target_'.")
+        params = {key: value for key, value in conf.items() if key != "_target_"}
+        params.update(kwargs)
+        module_name, class_name = conf["_target_"].rsplit(".", 1)
+        return getattr(importlib.import_module(module_name), class_name)(**params)
+try:
+    from safetensors.torch import load_file
+except ImportError:  # pragma: no cover - only needed for optional VGGT safetensors loading
+    def load_file(*args, **kwargs):
+        raise ImportError("safetensors is required for load_pretrained_weights_path_vggt.")
 
 from dvgt.models.backbones.dvgt2_aggregator import DVGT2Aggregator
 from dvgt.models.heads.dpt_head import DPTHead

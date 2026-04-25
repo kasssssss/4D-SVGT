@@ -12,6 +12,21 @@ from dvgt.models.layers.mrope_i import MRopeInterleaveEmbedding, get_mrope_inter
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
+if not hasattr(torch.amp, "custom_fwd") and hasattr(torch.cuda.amp, "custom_fwd"):
+    def _custom_fwd_compat(*args, **kwargs):
+        kwargs.pop("device_type", None)
+        return torch.cuda.amp.custom_fwd(*args, **kwargs)
+
+    torch.amp.custom_fwd = _custom_fwd_compat
+if not hasattr(torch.amp, "custom_bwd") and hasattr(torch.cuda.amp, "custom_bwd"):
+    def _custom_bwd_compat(*args, **kwargs):
+        kwargs.pop("device_type", None)
+        if not args and not kwargs:
+            return lambda fn: torch.cuda.amp.custom_bwd(fn)
+        return torch.cuda.amp.custom_bwd(*args, **kwargs)
+
+    torch.amp.custom_bwd = _custom_bwd_compat
+
 class DVGT2Aggregator(nn.Module):
     """
     The Aggregator applies alternating-attention over input frames,
@@ -81,7 +96,7 @@ class DVGT2Aggregator(nn.Module):
         if dino_v3_weight_path:
             self.patch_embed = torch.hub.load('third_party/dinov3', patch_embed, source='local', weights=dino_v3_weight_path)   # Load model code and weight
         else:
-            self.patch_embed = torch.hub.load('third_party/dinov3', patch_embed, source='local')   # Only load model code
+            self.patch_embed = torch.hub.load('third_party/dinov3', patch_embed, source='local', pretrained=False)   # Only load model code
         # Disable gradient updates for mask token
         if hasattr(self.patch_embed, "mask_token"):
             self.patch_embed.mask_token.requires_grad_(False)
@@ -137,6 +152,7 @@ class DVGT2Aggregator(nn.Module):
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         past_frame_idx: int = 0,
+        return_patch_tokens: bool = False,
     ) -> Tuple[List[torch.Tensor], int, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         """
         Args:
@@ -167,6 +183,7 @@ class DVGT2Aggregator(nn.Module):
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
+        raw_patch_tokens = patch_tokens.view(B, T, V, patch_tokens.shape[1], patch_tokens.shape[2]).contiguous()
 
         # Special tokens
         register_token = self.register_token.expand(B * T * V, -1, -1).contiguous()
@@ -236,6 +253,8 @@ class DVGT2Aggregator(nn.Module):
 
         del concat_inter, intra_view_intermediates, cross_view_intermediates, cross_frame_intermediates
 
+        if return_patch_tokens:
+            return output_list, self.patch_start_idx, next_key_values, raw_patch_tokens
         return output_list, self.patch_start_idx, next_key_values
 
     def _process_intra_view_attention(self, tokens, B, T, V, P, C, start_idx, pos):

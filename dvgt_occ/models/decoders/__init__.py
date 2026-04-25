@@ -3,6 +3,7 @@ from .sth_style_dense_decoder import (
     GSDenseDecoder,
     OccDenseDecoder,
     STHStyleDenseDecoder,
+    TemporalModule,
 )
 
 __all__ = [
@@ -10,4 +11,5 @@ __all__ = [
     "GSDenseDecoder",
     "OccDenseDecoder",
     "STHStyleDenseDecoder",
+    "TemporalModule",
 ]

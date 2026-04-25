@@ -12,7 +12,15 @@ import random
 import numpy as np
 from typing import Union, Optional
 import logging
-from iopath.common.file_io import g_pathmgr
+try:
+    from iopath.common.file_io import g_pathmgr
+except ImportError:  # pragma: no cover - lightweight training containers may not ship iopath
+    class _LocalPathManager:
+        @staticmethod
+        def open(path, mode="r", *args, **kwargs):
+            return open(path, mode, *args, **kwargs)
+
+    g_pathmgr = _LocalPathManager()
 import torch.distributed as dist
 from pathlib import Path
 from typing import Dict, Iterable, List

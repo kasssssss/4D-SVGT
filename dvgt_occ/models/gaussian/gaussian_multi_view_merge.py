@@ -28,6 +28,7 @@ class GaussianMultiViewMerge(nn.Module):
             return gaussians
 
         center = gaussians.center.clone()
+        dense_feat = gaussians.dense_feat.clone()
         offset = gaussians.offset.clone()
         opacity = gaussians.opacity.clone()
         scale = gaussians.scale.clone()
@@ -71,6 +72,7 @@ class GaussianMultiViewMerge(nn.Module):
                     rotation_vals = rotation[batch_idx, time_idx, sel_v, sel_h, sel_w]
                     feat_dc_vals = feat_dc[batch_idx, time_idx, sel_v, sel_h, sel_w]
                     keep_vals = keep_score[batch_idx, time_idx, sel_v, sel_h, sel_w]
+                    dense_vals = dense_feat[batch_idx, time_idx, sel_v, sel_h, sel_w]
                     instance_vals = instance_affinity[batch_idx, time_idx, sel_v, sel_h, sel_w]
                     motion_vals = motion_code[batch_idx, time_idx, sel_v, sel_h, sel_w]
 
@@ -82,10 +84,12 @@ class GaussianMultiViewMerge(nn.Module):
                     mean_rotation = F.normalize((rotation_vals * weight_view).sum(dim=0), dim=-1).to(rotation.dtype)
                     mean_feat_dc = (feat_dc_vals * weight_view).sum(dim=0).to(feat_dc.dtype)
                     mean_keep = keep_vals.max(dim=0).values.to(keep_score.dtype)
+                    mean_dense = (dense_vals * weight_view).sum(dim=0).to(dense_feat.dtype)
                     mean_instance = (instance_vals * weight_view).sum(dim=0).to(instance_affinity.dtype)
                     mean_motion = (motion_vals * weight_view).sum(dim=0).to(motion_code.dtype)
 
                     center[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_center
+                    dense_feat[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_dense
                     offset[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_offset
                     opacity[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_opacity
                     scale[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_scale
@@ -102,6 +106,7 @@ class GaussianMultiViewMerge(nn.Module):
                         dup_h = sel_h[dup_mask]
                         dup_w = sel_w[dup_mask]
                         center[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_center
+                        dense_feat[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_dense
                         offset[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_offset
                         opacity[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_opacity * self.duplicate_keep_scale
                         scale[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_scale
@@ -112,6 +117,7 @@ class GaussianMultiViewMerge(nn.Module):
                         motion_code[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_motion
 
         return GaussianOutput(
+            dense_feat=dense_feat,
             center=center,
             offset=offset,
             opacity=opacity,

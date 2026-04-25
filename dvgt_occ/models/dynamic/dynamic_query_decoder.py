@@ -46,7 +46,11 @@ class DynamicQueryDecoder(nn.Module):
         self.pre_norm = nn.LayerNorm(query_dim)
         self.self_attn = nn.MultiheadAttention(query_dim, num_heads=8, batch_first=True)
         self.ref_point_head = nn.Linear(query_dim, 3)
-        self.attn = MultiScaleDeformable3DAttention(query_dim=query_dim, samples_per_scale=occ_samples_per_scale)
+        self.attn = MultiScaleDeformable3DAttention(
+            query_dim=query_dim,
+            samples_per_scale=occ_samples_per_scale,
+            volume_channels=(64, 128, 128),
+        )
         self.local_token_proj = nn.Linear(local_feature_dim + 3, query_dim)
         self.local_attn = nn.MultiheadAttention(query_dim, num_heads=8, batch_first=True)
         self.ffn_norm = nn.LayerNorm(query_dim)

@@ -32,8 +32,14 @@ class DVGTOccConfig:
     patch_size: int = 16
     token_dim: int = 1024
     agg_token_dim: int = 3072
+    raw_patch_token_dim: int = 1024
     neck_dim: int = 256
     full_dim: int = 128
+    dynamic_dense_dim: int = 128
+    occ_lift_dim: int = 64
+    occ_base_dim: int = 64
+    occ_bottleneck_dim: int = 128
+    gs_feature_dim: int = 128
     dynamic_query_dim: int = 256
     instance_dim: int = 32
     motion_dim: int = 16
@@ -47,6 +53,8 @@ class DVGTOccConfig:
     occ_samples_per_scale: int = 8
     gs_bias_scale: float = 0.75
     render_splat_radius: int = 4
+    render_source_weight: float = 1.0
+    render_heldout_weight: float = 0.1
     sky_hidden_dim: int = 64
     sky_fourier_freqs: int = 6
     selected_layers: Tuple[int, ...] = (4, 11, 17, 23)
@@ -61,6 +69,10 @@ class DVGTOccConfig:
     def patch_tokens(self) -> int:
         hp, wp = self.patch_grid
         return hp * wp
+
+    @property
+    def joint_token_dim(self) -> int:
+        return self.agg_token_dim + self.raw_patch_token_dim
 
     @property
     def total_queries(self) -> int:

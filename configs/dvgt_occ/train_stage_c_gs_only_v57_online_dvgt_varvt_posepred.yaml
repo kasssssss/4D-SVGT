@@ -2,11 +2,6 @@ data:
   manifest: data/nuscenes_dvgt_v0/manifest_trainval.json
   output_root: data/nuscenes_dvgt_v0
   require_supervision_frozen: false
-  supervision_ready_files:
-    - data/nuscenes_dvgt_v0/logs/dev_backfill_full_20260419/sam3_backfill_full.status
-    - data/nuscenes_dvgt_v0/logs/dev_backfill_full_20260419/postprocess_after_backfill.status
-    - data/nuscenes_dvgt_v0/logs/dev_backfill_full_20260419/audit_after_backfill.json
-    - data/nuscenes_dvgt_v0/qc/sam3_mask_consistency_backfill_full/summary.json
   train_scene_ids: ["000", "001", "002", "003", "005", "006", "007", "008"]
   val_scene_ids: ["004", "009"]
   train_limit: null
@@ -17,6 +12,20 @@ data:
   dynamic_val_limit: null
   dynamic_val_only: true
   dynamic_val_min_dynamic_pixels: 1024
+  online_dvgt: true
+  online_min_frames: 4
+  online_max_frames: 8
+  online_temporal_strides: [1, 2, 5]
+  online_min_views: 2
+  online_max_views: 6
+  online_heldout_target: true
+
+online_dvgt:
+  enabled: true
+  checkpoint: pretrained/dvgt2.pt
+  dino_v3_weight_path: null
+  points_metric_scale: 10.0
+  allow_missing_pose_head: false
 
 model:
   num_frames: 8
@@ -37,15 +46,15 @@ model:
   render_splat_radius: 4
 
 train:
-  seed: 42
+  seed: 57
   batch_size: 1
   num_workers: 0
   max_steps: 5000
   log_interval: 10
   save_interval: 100
   val_interval: 100
-  val_batches: 16
-  dynamic_val_batches: 16
+  val_batches: 8
+  dynamic_val_batches: 8
   amp: false
   gradient_checkpointing: true
   grad_clip: 1.0
@@ -57,12 +66,12 @@ train:
   bridge_start_step: 2000
   stability_start_step: 2000
   allow_tf32: true
-  log_dir: data/nuscenes_dvgt_v0/logs/train_stage_c_gs_only_v1
-  visualize_every_epochs: 25
+  log_dir: data/nuscenes_dvgt_v0/logs/train_stage_c_gs_only_v57_online_dvgt_varvt_posepred
+  visualize_every_epochs: 1
   visualize_frame_index: 0
   visualize_view_index: 0
   visualize_sample_index: 0
-  visualize_max_scene_points: 20000
+  visualize_max_scene_points: 30000
 
 ddp:
   backend: nccl
@@ -74,6 +83,7 @@ ddp:
 optimizer:
   base_lr: 1.0e-4
   gs_lr: 1.0e-4
+  sky_lr: 1.0e-4
   bridge_lr: 1.0e-4
   betas: [0.9, 0.999]
   weight_decay: 1.0e-4
@@ -103,48 +113,8 @@ loss_weights:
     motion_cons: 0.0
     gs_sparse: 0.0
   bridge_warmup:
-    dyn_soft: 0.0
-    presence: 0.0
-    query_match: 0.0
-    query_cls: 0.0
-    query_box3d: 0.0
-    track_mem_feat: 0.0
-    track_mem_box: 0.0
-    birth_death: 0.0
-    occ: 0.0
-    sem_occ: 0.0
-    dyn_occ: 0.0
     gs_render: 1.0
     sky_alpha: 1.0
-    inst_contrast: 0.0
-    query2gs: 0.0
-    q2gs_null: 0.0
-    mask_render: 0.0
-    occ_local2gs: 0.0
-    gs2occ_local: 0.0
-    sem_proj_2d: 0.0
-    motion_cons: 0.0
-    gs_sparse: 0.0
   after_stability:
-    dyn_soft: 0.0
-    presence: 0.0
-    query_match: 0.0
-    query_cls: 0.0
-    query_box3d: 0.0
-    track_mem_feat: 0.0
-    track_mem_box: 0.0
-    birth_death: 0.0
-    occ: 0.0
-    sem_occ: 0.0
-    dyn_occ: 0.0
     gs_render: 1.0
     sky_alpha: 1.0
-    inst_contrast: 0.0
-    query2gs: 0.0
-    q2gs_null: 0.0
-    mask_render: 0.0
-    occ_local2gs: 0.0
-    gs2occ_local: 0.0
-    sem_proj_2d: 0.0
-    motion_cons: 0.0
-    gs_sparse: 0.0

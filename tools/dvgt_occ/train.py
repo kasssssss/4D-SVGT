@@ -33,6 +33,7 @@ from dvgt_occ import DEFAULT_DVGT_OCC_CONFIG, DVGTOccConfig
 from dvgt_occ.data import DVGTOccClipDataset
 from dvgt_occ.data.manifest import load_manifest
 from dvgt_occ.models import DVGTOccModel
+from dvgt_occ.models.backbones.frozen_dvgt_wrapper import FrozenDVGTWrapper
 from dvgt_occ.training import (
     DEFAULT_CACHE_KEYS,
     DEFAULT_STAGE_B_SCAFFOLD_WEIGHTS,
@@ -54,6 +55,9 @@ from dvgt_occ.training import (
     stage_b_after_stability_weights,
     stage_c_bridge_warmup_weights,
 )
+from dvgt.evaluation.utils.geometry import accumulate_transform_points_and_pose_to_first_frame
+from dvgt.models.architectures.dvgt2 import DVGT2
+from dvgt.utils.pose_encoding import decode_pose
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +101,24 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def configure_torch_cuda_arch_list() -> str | None:
+    if not torch.cuda.is_available():
+        return None
+    archs: list[str] = []
+    for device_idx in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(device_idx)
+        arch = f"{props.major}.{props.minor}"
+        if arch not in archs:
+            archs.append(arch)
+    if not archs:
+        return None
+    arch_list = ";".join(archs)
+    os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
+    cache_suffix = arch_list.replace(".", "").replace(";", "_")
+    os.environ.setdefault("TORCH_EXTENSIONS_DIR", f"/tmp/torch_extensions_{cache_suffix}")
+    return arch_list
+
+
 def init_distributed(timeout_sec: int, backend_override: str | None = None) -> tuple[bool, int, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -127,6 +149,7 @@ def build_runtime_config(args: argparse.Namespace, cfg: Dict[str, object]) -> Di
     data_cfg = dict(cfg.get("data", {}))
     train_cfg = dict(cfg.get("train", {}))
     ddp_cfg = dict(cfg.get("ddp", {}))
+    online_cfg = dict(cfg.get("online_dvgt", {}))
     ready_files = [Path(path) for path in data_cfg.get("supervision_ready_files", [])]
     runtime = {
         "manifest": Path(args.manifest or data_cfg.get("manifest", "data/nuscenes_dvgt_v0/manifest_trainval.json")),
@@ -150,11 +173,30 @@ def build_runtime_config(args: argparse.Namespace, cfg: Dict[str, object]) -> Di
         "dynamic_val_only": bool(data_cfg.get("dynamic_val_only", bool(data_cfg.get("dynamic_val_scene_ids")))),
         "dynamic_val_min_dynamic_pixels": int(data_cfg.get("dynamic_val_min_dynamic_pixels", data_cfg.get("val_min_dynamic_pixels", 32))),
         "dynamic_val_batches": int(train_cfg.get("dynamic_val_batches", args.val_batches if args.val_batches is not None else train_cfg.get("val_batches", 32))),
+        "online_dvgt": bool(data_cfg.get("online_dvgt", online_cfg.get("enabled", False))),
+        "online_min_frames": int(data_cfg.get("online_min_frames", online_cfg.get("min_frames", 4))),
+        "online_max_frames": int(data_cfg.get("online_max_frames", online_cfg.get("max_frames", 8))),
+        "online_temporal_strides": tuple(int(x) for x in data_cfg.get("online_temporal_strides", online_cfg.get("temporal_strides", [1, 2, 5]))),
+        "online_min_views": int(data_cfg.get("online_min_views", online_cfg.get("min_views", 2))),
+        "online_max_views": int(data_cfg.get("online_max_views", online_cfg.get("max_views", 6))),
+        "online_heldout_target": bool(data_cfg.get("online_heldout_target", online_cfg.get("heldout_target", True))),
+        "online_checkpoint": Path(online_cfg.get("checkpoint", data_cfg.get("dvgt_checkpoint", "pretrained/dvgt2.pt"))),
+        "online_dino_v3_weight_path": online_cfg.get("dino_v3_weight_path", None),
+        "online_points_metric_scale": float(online_cfg.get("points_metric_scale", 10.0)),
+        "online_pose_mode": str(online_cfg.get("pose_mode", data_cfg.get("online_pose_mode", "pred"))),
+        "online_anchor_mode": str(online_cfg.get("anchor_mode", data_cfg.get("online_anchor_mode", "point_xyz"))),
+        "online_allow_missing_pose_head": bool(online_cfg.get("allow_missing_pose_head", False)),
         "grad_clip": float(train_cfg.get("grad_clip", 1.0)),
         "amp": bool(train_cfg.get("amp", True)),
         "gradient_checkpointing": bool(train_cfg.get("gradient_checkpointing", False)),
         "train_target": str(train_cfg.get("train_target", "joint")),
         "train_mode": str(train_cfg.get("train_mode", "v1-stable")),
+        "mask_all_weight": float(
+            train_cfg.get(
+                "mask_all_weight",
+                0.0 if str(train_cfg.get("train_mode", "v1-stable")) == "v1-stable" else 0.25,
+            )
+        ),
         "warmup_iters": int(train_cfg.get("warmup_iters", 1500)),
         "min_lr": float(train_cfg.get("min_lr", 1e-6)),
         "require_supervision_frozen": bool(data_cfg.get("require_supervision_frozen", False)),
@@ -205,6 +247,8 @@ def build_model_config(cfg: Dict[str, object]) -> DVGTOccConfig:
         "occ_samples_per_scale": int(model_cfg.get("occ_samples_per_scale", base.occ_samples_per_scale)),
         "gs_bias_scale": float(model_cfg.get("gs_bias_scale", base.gs_bias_scale)),
         "render_splat_radius": int(model_cfg.get("render_splat_radius", base.render_splat_radius)),
+        "render_source_weight": float(model_cfg.get("render_source_weight", base.render_source_weight)),
+        "render_heldout_weight": float(model_cfg.get("render_heldout_weight", base.render_heldout_weight)),
         "selected_layers": tuple(model_cfg.get("selected_layers", list(base.selected_layers))),
         "camera_view_ids": tuple(model_cfg.get("camera_view_ids", list(base.camera_view_ids))),
         "occ_grid": base.occ_grid,
@@ -230,7 +274,7 @@ def build_optimizer(model: torch.nn.Module, cfg: Dict[str, object]) -> torch.opt
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if name.startswith("gs_head."):
+        if name.startswith("gs_head.") or name.startswith("gs_reassembly."):
             groups["gs"]["params"].append(param)
         elif name.startswith("sky_model."):
             groups["sky"]["params"].append(param)
@@ -252,9 +296,12 @@ def configure_trainable_modules(model: torch.nn.Module, train_target: str, train
     if train_target == "occ_only":
         enabled_prefixes = ("reassembly.", "dynamic_dense.", "occ_head.")
     elif train_target == "gs_only":
-        enabled_prefixes = ("reassembly.", "dynamic_dense.", "gs_head.")
-        if train_mode == "v1-sky-ablation":
-            enabled_prefixes = enabled_prefixes + ("sky_model.",)
+        if train_mode == "v1-gs-aux":
+            enabled_prefixes = ("reassembly.", "gs_reassembly.", "dynamic_dense.", "gs_head.")
+        elif train_mode == "v1-sky-ablation":
+            enabled_prefixes = ("gs_reassembly.", "gs_head.", "sky_model.")
+        else:
+            enabled_prefixes = ("gs_reassembly.", "gs_head.", "sky_model.")
     elif train_target == "sky_only":
         enabled_prefixes = ("sky_model.",)
     else:
@@ -322,11 +369,13 @@ def build_dataset(
     model_cfg: DVGTOccConfig,
     scene_ids: Sequence[str] | None,
     limit: int | None,
+    runtime: Dict[str, object],
 ) -> DVGTOccClipDataset:
+    online = bool(runtime.get("online_dvgt", False))
     return DVGTOccClipDataset(
         manifest_path=manifest,
         root=root,
-        load_cache=True,
+        load_cache=not online,
         load_supervision=True,
         load_scene_sam3_full=True,
         full_res_size=(model_cfg.image_height, model_cfg.image_width),
@@ -335,6 +384,13 @@ def build_dataset(
         supervision_keys=DEFAULT_SUPERVISION_KEYS,
         scene_ids=scene_ids,
         limit=limit,
+        online_sample=online,
+        min_frames=int(runtime.get("online_min_frames", 4)),
+        max_frames=int(runtime.get("online_max_frames", 8)),
+        temporal_strides=runtime.get("online_temporal_strides", (1, 2, 5)),
+        min_views=int(runtime.get("online_min_views", 2)),
+        max_views=int(runtime.get("online_max_views", 6)),
+        heldout_target=bool(runtime.get("online_heldout_target", True)),
     )
 
 
@@ -374,12 +430,197 @@ def build_loader(dataset: DVGTOccClipDataset, batch_size: int, num_workers: int,
     return loader, sampler
 
 
+def build_online_dvgt_frontend(runtime: Dict[str, object], model_cfg: DVGTOccConfig, device: torch.device) -> FrozenDVGTWrapper | None:
+    if not bool(runtime.get("online_dvgt", False)):
+        return None
+    dino_path = runtime.get("online_dino_v3_weight_path")
+    dvgt = DVGT2(
+        dino_v3_weight_path=str(dino_path) if dino_path else None,
+        use_causal_mask=True,
+        future_frame_window=8,
+        relative_pose_window=1,
+        ego_pose_head_conf={
+            "_target_": "dvgt.models.heads.dvgt2_ego_pose_head.DVGT2EgoPoseHead",
+            "max_frames": 48,
+            "future_frame_window": 8,
+            "relative_pose_window": 1,
+        },
+    )
+    checkpoint_path = Path(runtime["online_checkpoint"])
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = Path.cwd() / checkpoint_path
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state = checkpoint.get("model", checkpoint.get("state_dict", checkpoint)) if isinstance(checkpoint, dict) else checkpoint
+    if not any(str(key).startswith("ego_pose_head.") for key in state.keys()):
+        if not bool(runtime.get("online_allow_missing_pose_head", False)):
+            raise RuntimeError(
+                f"Online DVGT checkpoint has no ego_pose_head.* weights: {checkpoint_path}. "
+                "Use a DVGT checkpoint with pose head, or set online_dvgt.allow_missing_pose_head only for diagnostics."
+            )
+    missing, unexpected = dvgt.load_state_dict(state, strict=False)
+    wrapper = FrozenDVGTWrapper(dvgt, selected_layers=model_cfg.selected_layers).to(device)
+    wrapper.eval()
+    wrapper._load_summary = {  # type: ignore[attr-defined]
+        "checkpoint": str(checkpoint_path),
+        "missing": list(missing),
+        "unexpected": list(unexpected),
+    }
+    return wrapper
+
+
+def _ray_reanchor_points_from_source_depth(
+    points_world: torch.Tensor,
+    source_camera_to_world: torch.Tensor,
+    source_intrinsics: torch.Tensor,
+    *,
+    min_depth: float = 0.5,
+    max_depth: float = 120.0,
+) -> torch.Tensor:
+    """Keep DVGT depth, but force each source anchor onto its own camera ray."""
+    b, t, v, h, w, _ = points_world.shape
+    device = points_world.device
+    dtype = points_world.dtype
+    points_h = torch.cat([points_world, torch.ones((*points_world.shape[:-1], 1), device=device, dtype=dtype)], dim=-1)
+    world_to_camera = torch.linalg.inv(source_camera_to_world.float()).to(dtype)
+    cam = torch.einsum("btvij,btvhwj->btvhwi", world_to_camera, points_h)[..., :3]
+    depth = cam[..., 2].clamp(min=float(min_depth), max=float(max_depth))
+
+    ys = torch.arange(h, device=device, dtype=dtype)
+    xs = torch.arange(w, device=device, dtype=dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    fx = source_intrinsics[:, None, :, 0, None, None].to(dtype).clamp_min(1e-6)
+    fy = source_intrinsics[:, None, :, 1, None, None].to(dtype).clamp_min(1e-6)
+    cx = source_intrinsics[:, None, :, 2, None, None].to(dtype)
+    cy = source_intrinsics[:, None, :, 3, None, None].to(dtype)
+    x_cam = (grid_x[None, None, None] - cx) * depth / fx
+    y_cam = (grid_y[None, None, None] - cy) * depth / fy
+    cam_reanchored = torch.stack([x_cam, y_cam, depth], dim=-1)
+    cam_h = torch.cat([cam_reanchored, torch.ones((*cam_reanchored.shape[:-1], 1), device=device, dtype=dtype)], dim=-1)
+    world = torch.einsum("btvij,btvhwj->btvhwi", source_camera_to_world.to(dtype), cam_h)[..., :3]
+    return world
+
+
+@torch.no_grad()
+def prepare_batch_for_model(
+    batch: Dict[str, object],
+    online_frontend: FrozenDVGTWrapper | None,
+    runtime: Dict[str, object],
+) -> Dict[str, object]:
+    if online_frontend is None:
+        return batch
+    if "source_rgb" not in batch:
+        raise RuntimeError("online_dvgt is enabled but batch has no source_rgb.")
+    frontend_out = online_frontend(batch["source_rgb"])
+    points_ego_n = frontend_out.get("points")
+    points_conf = frontend_out.get("points_conf")
+    rel_pose = frontend_out.get("relative_ego_pose_enc")
+    if points_ego_n is None or points_conf is None:
+        raise RuntimeError("Frozen DVGT online frontend did not return points/points_conf.")
+    if rel_pose is None:
+        raise RuntimeError("Frozen DVGT online frontend did not return relative_ego_pose_enc.")
+
+    metric_scale = float(runtime.get("online_points_metric_scale", 1.0))
+    pose_mode = str(runtime.get("online_pose_mode", "pred"))
+    points_ego_n = points_ego_n.float() * metric_scale
+    ego_curr_ego_past, _ = decode_pose(rel_pose.float(), pose_encoding_type="absT_quaR")
+    ego_curr_ego_past = ego_curr_ego_past.float()
+    ego_curr_ego_past[..., :3, 3] *= metric_scale
+    pred_ego_n_to_first, points_first = accumulate_transform_points_and_pose_to_first_frame(
+        ego_curr_ego_past,
+        points_ego_n,
+    )
+
+    batch["aggregated_tokens"] = frontend_out["aggregated_tokens"]
+    batch["raw_patch_tokens"] = frontend_out["raw_patch_tokens"]
+    batch["points_in_ego_n"] = points_ego_n
+    batch["points"] = points_first
+    batch["points_conf"] = points_conf.float()
+    batch["relative_ego_pose_enc"] = rel_pose
+    batch["pred_ego_curr_ego_past"] = ego_curr_ego_past
+    batch["pred_ego_n_to_first_ego"] = pred_ego_n_to_first
+
+    b = points_first.shape[0]
+    identity = torch.eye(4, device=points_first.device, dtype=points_first.dtype).unsqueeze(0).repeat(b, 1, 1)
+    batch["first_ego_pose_world"] = identity
+    source_camera_to_ego = batch["source_camera_to_ego"].to(points_first.dtype)
+    target_camera_to_ego = batch["target_camera_to_ego"].to(points_first.dtype)
+    pred_pose = pred_ego_n_to_first.to(points_first.dtype)
+    if pose_mode == "pred":
+        batch["points"] = points_first
+        batch["source_camera_to_world"] = torch.einsum("btij,bvjk->btvik", pred_pose, source_camera_to_ego)
+        batch["camera_to_world"] = torch.einsum("btij,bvjk->btvik", pred_pose, target_camera_to_ego)
+    elif pose_mode == "local_ego":
+        # Per-frame ego_n rendering: no GT pose and no DVGT pose in the render chain.
+        # This isolates GS learning from temporal ego-pose quality while preserving novel-view checks within the same timestamp.
+        batch["points"] = points_ego_n
+        t = points_ego_n.shape[1]
+        batch["source_camera_to_world"] = source_camera_to_ego[:, None].expand(-1, t, -1, -1, -1).contiguous()
+        batch["camera_to_world"] = target_camera_to_ego[:, None].expand(-1, t, -1, -1, -1).contiguous()
+    elif pose_mode == "gt_debug":
+        if "gt_ego_n_to_first_ego" not in batch or "gt_source_camera_to_first_ego" not in batch or "gt_target_camera_to_first_ego" not in batch:
+            raise RuntimeError("online_pose_mode=gt_debug requires GT diagnostic poses in the batch.")
+        gt_pose = batch["gt_ego_n_to_first_ego"].to(points_first.dtype)
+        rot = gt_pose[..., :3, :3]
+        trans = gt_pose[..., :3, 3]
+        batch["points"] = points_ego_n @ rot.transpose(-1, -2)[:, :, None, None] + trans[:, :, None, None, None]
+        batch["source_camera_to_world"] = batch["gt_source_camera_to_first_ego"].to(points_first.dtype)
+        batch["camera_to_world"] = batch["gt_target_camera_to_first_ego"].to(points_first.dtype)
+    else:
+        raise ValueError(f"Unsupported online_pose_mode: {pose_mode}")
+    anchor_mode = str(runtime.get("online_anchor_mode", "point_xyz"))
+    if anchor_mode == "ray_depth":
+        batch["points"] = _ray_reanchor_points_from_source_depth(
+            batch["points"],
+            batch["source_camera_to_world"],
+            batch["source_camera_intrinsics"],
+        )
+    elif anchor_mode != "point_xyz":
+        raise ValueError(f"Unsupported online_anchor_mode: {anchor_mode}")
+    batch["_online_pose_mode"] = pose_mode
+    batch["_online_anchor_mode"] = anchor_mode
+    batch["camera_intrinsics"] = batch["target_camera_intrinsics"]
+    if "gt_ego_n_to_first_ego" in batch:
+        gt_pose = batch["gt_ego_n_to_first_ego"].to(points_first.dtype)
+        trans_err = (pred_pose[..., :3, 3] - gt_pose[..., :3, 3]).norm(dim=-1)
+        batch["_pose_diag_trans_err_mean"] = trans_err.mean()
+    return batch
+
+
 def append_jsonl(path: Path, record: Dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
         f.flush()
         os.fsync(f.fileno())
+
+
+def _build_console_train_record(
+    step: int,
+    loss_total: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    loss_dict: Dict[str, torch.Tensor],
+    loss_weights: LossWeights,
+    outputs: Dict[str, object],
+    batch: Dict[str, object],
+) -> Dict[str, object]:
+    payload: Dict[str, object] = {
+        "step": step,
+        "loss_total": float(loss_total.detach().item()),
+        "lr": optimizer.param_groups[0]["lr"],
+    }
+    for key, weight in loss_weights.to_dict().items():
+        if float(weight) > 0.0 and key in loss_dict:
+            payload[f"loss_{key}"] = float(loss_dict[key].detach().item())
+    debug_metrics = collect_debug_metrics_with_batch(outputs, batch)
+    for key in (
+        "debug_render_rgb_mean",
+        "debug_render_alpha_mean",
+        "debug_gauss_scale_mean",
+        "debug_gauss_keep_mean",
+    ):
+        if key in debug_metrics:
+            payload[key] = float(debug_metrics[key].detach().item())
+    return payload
 
 
 def _tensor_nonfinite_summary(name: str, tensor: torch.Tensor) -> Dict[str, object] | None:
@@ -472,6 +713,24 @@ def save_checkpoint(path: Path, step: int, raw_model: torch.nn.Module, optimizer
     torch.save(payload, path)
 
 
+def _build_render_valid_mask_for_debug(points_conf: torch.Tensor, threshold: float = 0.30, dilate_px: int = 5) -> torch.Tensor:
+    b, t, v, h, w = points_conf.shape
+    conf = points_conf.float().reshape(b * t * v, h * w)
+    q05 = torch.quantile(conf, 0.05, dim=1, keepdim=True)
+    q95 = torch.quantile(conf, 0.95, dim=1, keepdim=True)
+    denom = (q95 - q05).clamp_min(1e-6)
+    conf_norm = ((conf - q05) / denom).clamp(0.0, 1.0)
+    raw_min = conf.min(dim=1, keepdim=True).values
+    raw_max = conf.max(dim=1, keepdim=True).values
+    looks_prob = (raw_min >= 0.0) & (raw_max <= 1.0 + 1e-4)
+    conf_for_mask = torch.where(looks_prob, conf.clamp(0.0, 1.0), conf_norm)
+    mask = (conf_for_mask > threshold).float().reshape(b * t * v, 1, h, w)
+    if dilate_px > 0:
+        kernel = dilate_px * 2 + 1
+        mask = torch.nn.functional.max_pool2d(mask, kernel_size=kernel, stride=1, padding=dilate_px)
+    return mask.reshape(b, t, v, 1, h, w)
+
+
 def collect_debug_metrics(outputs: Dict[str, object]) -> Dict[str, torch.Tensor]:
     return collect_debug_metrics_with_batch(outputs, None)
 
@@ -509,11 +768,21 @@ def collect_debug_metrics_with_batch(outputs: Dict[str, object], batch: Dict[str
         metrics["debug_gauss_keep_gt_01_ratio"] = (gaussians.keep_score > 0.1).float().mean()
         metrics["debug_gauss_keep_gt_05_ratio"] = (gaussians.keep_score > 0.5).float().mean()
         metrics["debug_gauss_effective_count_bt_mean"] = (gaussians.keep_score > 0.1).float().reshape(gaussians.keep_score.shape[0], gaussians.keep_score.shape[1], -1).sum(dim=-1).mean()
+        metrics["debug_gauss_conf_loss"] = (1.0 / gaussians.keep_score.clamp_min(1e-6)).abs().mean()
         metrics["debug_gauss_opacity_mean"] = gaussians.opacity.mean()
         metrics["debug_gauss_scale_mean"] = gaussians.scale.mean()
+        metrics["debug_gauss_feat_dc_mean"] = gaussians.feat_dc.mean()
+        metrics["debug_gauss_feat_dc_max"] = gaussians.feat_dc.max()
         if batch is not None and "gs_global_track_id_1_8" in batch:
-            supervised = (batch["gs_global_track_id_1_8"] >= 0).float()
+            gid = batch["gs_global_track_id_1_8"]
             keep = (gaussians.keep_score.squeeze(-1) > 0.1).float()
+            if gid.shape[-2:] != keep.shape[-2:]:
+                gid = torch.nn.functional.interpolate(
+                    gid.float().reshape(-1, 1, *gid.shape[-2:]),
+                    size=keep.shape[-2:],
+                    mode="nearest",
+                ).reshape(*keep.shape).long()
+            supervised = (gid >= 0).float()
             supervised_denom = supervised.sum().clamp_min(1.0)
             metrics["debug_gauss_supervised_ratio"] = supervised.mean()
             metrics["debug_gauss_supervised_kept_ratio"] = (keep * supervised).sum() / supervised_denom
@@ -523,21 +792,47 @@ def collect_debug_metrics_with_batch(outputs: Dict[str, object], batch: Dict[str
     if render is not None:
         metrics["debug_render_alpha_coverage"] = (render.render_alpha_all > 1e-3).float().mean()
         metrics["debug_render_alpha_mean"] = render.render_alpha_all.mean()
+        metrics["debug_render_rgb_mean"] = render.render_rgb_all.mean()
+        metrics["debug_render_rgb_max"] = render.render_rgb_all.max()
         if render.debug_mean_sigma is not None:
             metrics["debug_render_sigma_mean"] = render.debug_mean_sigma
         if render.debug_touch_ratio is not None:
             metrics["debug_render_touch_ratio"] = render.debug_touch_ratio
+        if batch is not None and "rgb_target" in batch:
+            render_pred = render.render_rgb_all_composited if render.render_rgb_all_composited is not None else render.render_rgb_all
+            per_pixel_l1 = (render_pred - batch["rgb_target"]).abs().mean(dim=3)
+            target_is_source = batch.get("target_is_source")
+            if target_is_source is not None:
+                source_mask = target_is_source[:, None, :, None, None].to(per_pixel_l1.dtype)
+                heldout_mask = (1.0 - source_mask).to(per_pixel_l1.dtype)
+                pixels_per_target = per_pixel_l1.shape[1] * per_pixel_l1.shape[-1] * per_pixel_l1.shape[-2]
+                source_denom = source_mask.sum().clamp_min(1.0) * pixels_per_target
+                heldout_denom = heldout_mask.sum().clamp_min(1.0) * pixels_per_target
+                metrics["debug_render_source_l1"] = (per_pixel_l1 * source_mask).sum() / source_denom
+                metrics["debug_render_heldout_l1"] = (per_pixel_l1 * heldout_mask).sum() / heldout_denom
+                alpha_hit = (render.render_alpha_all > 1e-3).float().squeeze(3)
+                metrics["debug_render_source_alpha_coverage"] = (alpha_hit * source_mask).sum() / source_denom
+                metrics["debug_render_heldout_alpha_coverage"] = (alpha_hit * heldout_mask).sum() / heldout_denom
+    if batch is not None and "points_conf" in batch:
+        render_valid = _build_render_valid_mask_for_debug(batch["points_conf"])
+        metrics["debug_render_valid_ratio"] = render_valid.mean()
+    if batch is not None and "_pose_diag_trans_err_mean" in batch:
+        metrics["debug_pose_pred_gt_trans_err_mean"] = batch["_pose_diag_trans_err_mean"]
     return metrics
 
 
 @torch.no_grad()
 def evaluate(
     model: torch.nn.Module,
+    online_frontend: FrozenDVGTWrapper | None,
     loss_builder: DVGTOccLossBuilder,
     loader: DataLoader,
     device: torch.device,
+    runtime: Dict[str, object],
     ddp_enabled: bool,
     max_batches: int,
+    train_mode: str,
+    mask_all_weight: float,
     prefix: str = "val",
 ) -> Dict[str, float]:
     model.eval()
@@ -547,7 +842,9 @@ def evaluate(
         if max_batches > 0 and batch_idx >= max_batches:
             break
         batch = move_batch_to_device(batch, device)
-        batch["_train_mode"] = runtime["train_mode"]
+        batch = prepare_batch_for_model(batch, online_frontend, runtime)
+        batch["_train_mode"] = train_mode
+        batch["_mask_all_weight"] = mask_all_weight
         batch["_active_loss_weights"] = loss_builder.weights.to_dict()
         if hasattr(model, "module") and hasattr(model.module, "configure_optional_modules"):
             model.module.configure_optional_modules(batch["_active_loss_weights"])
@@ -569,10 +866,13 @@ def evaluate(
             for key, value in iou_threshold_sweep_from_logits(occ_logits, occ_target).items():
                 metrics[f"{prefix}_occ_{key}"] = value
         if outputs.get("render") is not None:
-            render_valid = render_valid_mask_from_points_conf(batch["points_conf"])
             render_pred = outputs["render"].render_rgb_all
-            if batch.get("_train_mode") == "v1-sky-ablation" and outputs["render"].render_rgb_all_composited is not None:
+            if outputs["render"].render_rgb_all_composited is not None:
                 render_pred = outputs["render"].render_rgb_all_composited
+            if render_pred.shape[:3] == batch["points_conf"].shape[:3]:
+                render_valid = render_valid_mask_from_points_conf(batch["points_conf"])
+            else:
+                render_valid = torch.ones_like(render_pred[:, :, :, :1])
             metrics[f"{prefix}_render_l1"] = masked_l1(render_pred, batch["rgb_target"], render_valid)
             metrics[f"{prefix}_render_psnr"] = masked_psnr(render_pred, batch["rgb_target"], render_valid)
             dyn_logits = torch.logit(outputs["render"].render_alpha_dynamic.clamp(1e-4, 1.0 - 1e-4))
@@ -603,6 +903,7 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     runtime = build_runtime_config(args, cfg)
+    configure_torch_cuda_arch_list()
     ddp_enabled, rank, world_size, local_rank = init_distributed(
         timeout_sec=runtime["ddp_timeout_sec"],
         backend_override=runtime["ddp_backend"],
@@ -620,8 +921,8 @@ def main() -> None:
         validate_supervision_contract(runtime)
 
         train_scene_ids, val_scene_ids = discover_scene_splits(runtime["manifest"], runtime["train_scene_ids"], runtime["val_scene_ids"])
-        train_dataset = build_dataset(runtime["manifest"], runtime["output_root"], model_cfg, train_scene_ids, runtime["train_limit"])
-        val_dataset = build_dataset(runtime["manifest"], runtime["output_root"], model_cfg, val_scene_ids, runtime["val_limit"]) if val_scene_ids else None
+        train_dataset = build_dataset(runtime["manifest"], runtime["output_root"], model_cfg, train_scene_ids, runtime["train_limit"], runtime)
+        val_dataset = build_dataset(runtime["manifest"], runtime["output_root"], model_cfg, val_scene_ids, runtime["val_limit"], runtime) if val_scene_ids else None
         if val_dataset is not None and runtime["val_dynamic_only"]:
             val_dataset = select_dynamic_subset(val_dataset, runtime["val_min_dynamic_pixels"])
         dynamic_val_scene_ids = runtime["dynamic_val_scene_ids"]
@@ -633,6 +934,7 @@ def main() -> None:
                 model_cfg,
                 dynamic_val_scene_ids if dynamic_val_scene_ids is not None else val_scene_ids,
                 runtime["dynamic_val_limit"],
+                runtime,
             )
             dynamic_val_dataset = select_dynamic_subset(dynamic_val_dataset, runtime["dynamic_val_min_dynamic_pixels"])
         if len(train_dataset) == 0:
@@ -653,6 +955,7 @@ def main() -> None:
             )
 
         model = DVGTOccModel(config=model_cfg).to(device)
+        online_frontend = build_online_dvgt_frontend(runtime, model_cfg, device)
         raw_model = model
         configure_trainable_modules(raw_model, runtime["train_target"], runtime["train_mode"])
         if runtime["gradient_checkpointing"] and hasattr(raw_model, "enable_gradient_checkpointing"):
@@ -676,7 +979,8 @@ def main() -> None:
         if runtime["resume"] is not None:
             checkpoint = torch.load(runtime["resume"], map_location=device)
             raw_model.load_state_dict(checkpoint["model"], strict=True)
-            optimizer.load_state_dict(checkpoint["optimizer"])
+            if os.environ.get("RESET_OPTIMIZER", "0") != "1":
+                optimizer.load_state_dict(checkpoint["optimizer"])
             start_step = int(checkpoint.get("step", -1)) + 1
 
         log_dir = runtime["log_dir"]
@@ -695,6 +999,7 @@ def main() -> None:
                 "base_loss_weights": base_weights.to_dict(),
                 "bridge_warmup_loss_weights": bridge_weights.to_dict(),
                 "after_stability_loss_weights": after_weights.to_dict(),
+                "online_dvgt_frontend": getattr(online_frontend, "_load_summary", None),
                 "ddp": {
                     "enabled": ddp_enabled,
                     "world_size": world_size,
@@ -752,6 +1057,7 @@ def main() -> None:
                 train_iter = iter(train_loader)
                 batch = next(train_iter)
             batch = move_batch_to_device(batch, device)
+            batch = prepare_batch_for_model(batch, online_frontend, runtime)
 
             loss_builder.weights = resolve_loss_weights(
                 step=step,
@@ -762,6 +1068,7 @@ def main() -> None:
                 stability_start_step=runtime["stability_start_step"],
             )
             batch["_train_mode"] = runtime["train_mode"]
+            batch["_mask_all_weight"] = runtime["mask_all_weight"]
             batch["_active_loss_weights"] = loss_builder.weights.to_dict()
             if hasattr(raw_model, "configure_optional_modules"):
                 raw_model.configure_optional_modules(batch["_active_loss_weights"])
@@ -793,6 +1100,29 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 continue
             loss_total.backward()
+            if rank == 0 and step % 10 == 0:
+                gs_head = getattr(raw_model, 'gs_head', None)
+                if gs_head is not None:
+                    head_conv = gs_head.head[-1]
+                    if head_conv.weight.grad is not None:
+                        g = head_conv.weight.grad
+                        w = head_conv.weight
+                        feat_dc_start = 3 + 1 + 3 + 4
+                        feat_dc_end = feat_dc_start + 3
+                        dc_grad = g[feat_dc_start:feat_dc_end]
+                        dc_weight = w[feat_dc_start:feat_dc_end]
+                        all_grad_norm = g.norm().item()
+                        dc_grad_norm = dc_grad.norm().item()
+                        dc_grad_mean = dc_grad.abs().mean().item()
+                        dc_weight_mean = dc_weight.abs().mean().item()
+                        print(f"[GRAD_DIAG] step={step} head_last_conv_grad_norm={all_grad_norm:.6f} "
+                              f"feat_dc_grad_norm={dc_grad_norm:.6f} feat_dc_grad_abs_mean={dc_grad_mean:.8f} "
+                              f"feat_dc_weight_abs_mean={dc_weight_mean:.6f}", flush=True)
+                    gaussians = outputs.get("gaussians")
+                    if gaussians is not None and gaussians.feat_dc.requires_grad and gaussians.feat_dc.grad is not None:
+                        print(f"[GRAD_DIAG] step={step} feat_dc_tensor_grad_norm={gaussians.feat_dc.grad.norm().item():.6f}", flush=True)
+                    elif gaussians is not None:
+                        print(f"[GRAD_DIAG] step={step} feat_dc requires_grad={gaussians.feat_dc.requires_grad} grad_fn={gaussians.feat_dc.grad_fn}", flush=True)
             bad_grads = _collect_nonfinite_gradients(raw_model)
             if bad_grads:
                 if rank == 0:
@@ -847,7 +1177,16 @@ def main() -> None:
                 )
                 last_train_record["skipped_nonfinite_steps"] = skipped_nonfinite_steps
                 if step % runtime["log_interval"] == 0 or step == runtime["max_steps"] - 1:
-                    print(json.dumps(last_train_record, ensure_ascii=False), flush=True)
+                    console_record = _build_console_train_record(
+                        step=step,
+                        loss_total=loss_total,
+                        optimizer=optimizer,
+                        loss_dict=loss_dict,
+                        loss_weights=loss_builder.weights,
+                        outputs=outputs,
+                        batch=batch,
+                    )
+                    print(json.dumps(console_record, ensure_ascii=False), flush=True)
                     append_jsonl(log_dir / "train_metrics.jsonl", last_train_record)
                     write_status_json(
                         log_dir / "run_status.json",
@@ -884,20 +1223,50 @@ def main() -> None:
             if rank == 0 and runtime["save_interval"] > 0 and (step + 1) % runtime["save_interval"] == 0:
                 save_checkpoint(log_dir / f"step_{step + 1:06d}.pt", step, raw_model, optimizer)
                 save_checkpoint(log_dir / "last.pt", step, raw_model, optimizer, score=best_score)
+                save_training_visualization(
+                    batch,
+                    outputs,
+                    model_cfg,
+                    log_dir / "checkpoint_visuals" / f"step_{step + 1:06d}.png",
+                    step=step,
+                    epoch=(step + 1) // max(epoch_size, 1),
+                    sample_idx=runtime["visualize_sample_index"],
+                    frame_idx=runtime["visualize_frame_index"],
+                    view_idx=runtime["visualize_view_index"],
+                    max_scene_points=runtime["visualize_max_scene_points"],
+                )
 
             if (val_loader is not None or dynamic_val_loader is not None) and runtime["val_interval"] > 0 and (step + 1) % runtime["val_interval"] == 0:
                 val_metrics: Dict[str, float] = {}
                 if val_loader is not None:
-                    val_metrics.update(evaluate(model, loss_builder, val_loader, device, ddp_enabled, runtime["val_batches"], prefix="val"))
+                    val_metrics.update(
+                        evaluate(
+                            model,
+                            online_frontend,
+                            loss_builder,
+                            val_loader,
+                            device,
+                            runtime,
+                            ddp_enabled,
+                            runtime["val_batches"],
+                            runtime["train_mode"],
+                            runtime["mask_all_weight"],
+                            prefix="val",
+                        )
+                    )
                 if dynamic_val_loader is not None:
                     val_metrics.update(
                         evaluate(
                             model,
+                            online_frontend,
                             loss_builder,
                             dynamic_val_loader,
                             device,
+                            runtime,
                             ddp_enabled,
                             runtime["dynamic_val_batches"],
+                            runtime["train_mode"],
+                            runtime["mask_all_weight"],
                             prefix="dynheavy_val",
                         )
                     )
@@ -915,6 +1284,18 @@ def main() -> None:
                     if best_score is None or score > best_score:
                         best_score = score
                         save_checkpoint(log_dir / "best.pt", step, raw_model, optimizer, score=score)
+                        save_training_visualization(
+                            batch,
+                            outputs,
+                            model_cfg,
+                            log_dir / "checkpoint_visuals" / f"best_step_{step + 1:06d}.png",
+                            step=step,
+                            epoch=(step + 1) // max(epoch_size, 1),
+                            sample_idx=runtime["visualize_sample_index"],
+                            frame_idx=runtime["visualize_frame_index"],
+                            view_idx=runtime["visualize_view_index"],
+                            max_scene_points=runtime["visualize_max_scene_points"],
+                        )
                     save_checkpoint(log_dir / "last.pt", step, raw_model, optimizer, score=best_score)
                     write_status_json(
                         log_dir / "run_status.json",

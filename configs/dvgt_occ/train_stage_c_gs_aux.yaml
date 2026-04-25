@@ -46,18 +46,18 @@ train:
   val_interval: 100
   val_batches: 16
   dynamic_val_batches: 16
-  amp: false
+  amp: true
   gradient_checkpointing: true
   grad_clip: 1.0
   train_target: gs_only
-  train_mode: v1-stable
+  train_mode: v1-gs-aux
   mask_all_weight: 0.0
   warmup_iters: 50
   min_lr: 1.0e-6
   bridge_start_step: 2000
   stability_start_step: 2000
   allow_tf32: true
-  log_dir: data/nuscenes_dvgt_v0/logs/train_stage_c_gs_only_v1
+  log_dir: data/nuscenes_dvgt_v0/logs/train_stage_c_gs_aux_v1
   visualize_every_epochs: 25
   visualize_frame_index: 0
   visualize_view_index: 0
@@ -80,7 +80,7 @@ optimizer:
 
 loss_weights:
   base:
-    dyn_soft: 0.0
+    dyn_soft: 0.05
     presence: 0.0
     query_match: 0.0
     query_cls: 0.0
@@ -92,18 +92,18 @@ loss_weights:
     sem_occ: 0.0
     dyn_occ: 0.0
     gs_render: 1.0
-    sky_alpha: 1.0
+    sky_alpha: 0.10
     inst_contrast: 0.0
     query2gs: 0.0
     q2gs_null: 0.0
-    mask_render: 0.0
+    mask_render: 0.05
     occ_local2gs: 0.0
     gs2occ_local: 0.0
     sem_proj_2d: 0.0
     motion_cons: 0.0
     gs_sparse: 0.0
   bridge_warmup:
-    dyn_soft: 0.0
+    dyn_soft: 0.05
     presence: 0.0
     query_match: 0.0
     query_cls: 0.0
@@ -115,18 +115,18 @@ loss_weights:
     sem_occ: 0.0
     dyn_occ: 0.0
     gs_render: 1.0
-    sky_alpha: 1.0
+    sky_alpha: 0.10
     inst_contrast: 0.0
     query2gs: 0.0
     q2gs_null: 0.0
-    mask_render: 0.0
+    mask_render: 0.05
     occ_local2gs: 0.0
     gs2occ_local: 0.0
     sem_proj_2d: 0.0
     motion_cons: 0.0
     gs_sparse: 0.0
   after_stability:
-    dyn_soft: 0.0
+    dyn_soft: 0.05
     presence: 0.0
     query_match: 0.0
     query_cls: 0.0
@@ -138,11 +138,11 @@ loss_weights:
     sem_occ: 0.0
     dyn_occ: 0.0
     gs_render: 1.0
-    sky_alpha: 1.0
+    sky_alpha: 0.10
     inst_contrast: 0.0
     query2gs: 0.0
     q2gs_null: 0.0
-    mask_render: 0.0
+    mask_render: 0.05
     occ_local2gs: 0.0
     gs2occ_local: 0.0
     sem_proj_2d: 0.0
