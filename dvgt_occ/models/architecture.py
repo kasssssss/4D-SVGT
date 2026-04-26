@@ -361,8 +361,9 @@ class DVGTOccModel(nn.Module):
         gs_token_map = F.adaptive_avg_pool3d(gs_token_map, (min(gs_features.shape[2], 2), 7, 7))
         gs_tokens = gs_token_map.flatten(2).transpose(1, 2)
 
+        occ_bridge_volume = occ.occ_volumes.get("occ_b", occ.occ_volumes["occ_1"])
         occ_tokens = F.adaptive_avg_pool3d(
-            occ.occ_volumes["occ_1"].reshape(bt, occ.occ_volumes["occ_1"].shape[2], *occ.occ_volumes["occ_1"].shape[-3:]),
+            occ_bridge_volume.reshape(bt, occ_bridge_volume.shape[2], *occ_bridge_volume.shape[-3:]),
             (min(self.config.occ_grid.shape_zyx[0], 4), 10, 10),
         ).flatten(2).transpose(1, 2)
         occ_tokens = self.occ_latent_proj(occ_tokens)

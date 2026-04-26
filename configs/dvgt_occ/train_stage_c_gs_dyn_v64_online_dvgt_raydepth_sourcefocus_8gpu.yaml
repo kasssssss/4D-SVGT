@@ -14,10 +14,10 @@ data:
   dynamic_val_min_dynamic_pixels: 1024
   online_dvgt: true
   online_min_frames: 4
-  online_max_frames: 8
+  online_max_frames: 6
   online_temporal_strides: [1, 2, 5]
   online_min_views: 2
-  online_max_views: 6
+  online_max_views: 4
   online_heldout_target: true
 
 online_dvgt:
@@ -47,31 +47,31 @@ model:
   gs_bias_scale: 1.25
   render_splat_radius: 4
   render_source_weight: 1.0
-  render_heldout_weight: 0.1
-  render_lpips_weight: 0.05
+  render_heldout_weight: 0.05
+  render_lpips_weight: 0.01
 
 train:
-  seed: 63
+  seed: 64
   batch_size: 1
   num_workers: 0
-  max_steps: 5000
+  max_steps: 12000
   log_interval: 10
-  save_interval: 100
-  val_interval: 100
-  val_batches: 8
-  dynamic_val_batches: 8
+  save_interval: 200
+  val_interval: 400
+  val_batches: 4
+  dynamic_val_batches: 4
   amp: true
   gradient_checkpointing: true
   grad_clip: 1.0
   train_target: gs_only
-  train_mode: v1-stable
+  train_mode: v1-gs-aux
   mask_all_weight: 0.0
-  warmup_iters: 50
+  warmup_iters: 100
   min_lr: 1.0e-6
   bridge_start_step: 2000
   stability_start_step: 2000
   allow_tf32: true
-  log_dir: data/nuscenes_dvgt_v0/logs/train_stage_c_gs_only_v63_online_dvgt_raydepth_anchor
+  log_dir: data/nuscenes_dvgt_v0/logs/train_stage_c_gs_dyn_v64_online_dvgt_raydepth_sourcefocus_8gpu
   visualize_every_epochs: 1
   visualize_frame_index: 0
   visualize_view_index: 0
@@ -86,10 +86,10 @@ ddp:
   static_graph: false
 
 optimizer:
-  base_lr: 1.0e-4
-  gs_lr: 1.0e-4
+  base_lr: 5.0e-5
+  gs_lr: 7.5e-5
   sky_lr: 1.0e-4
-  bridge_lr: 1.0e-4
+  bridge_lr: 5.0e-5
   betas: [0.9, 0.999]
   weight_decay: 1.0e-4
 
@@ -111,15 +111,19 @@ loss_weights:
     inst_contrast: 0.0
     query2gs: 0.0
     q2gs_null: 0.0
-    mask_render: 0.0
+    mask_render: 0.03
     occ_local2gs: 0.0
     gs2occ_local: 0.0
     sem_proj_2d: 0.0
     motion_cons: 0.0
     gs_sparse: 0.0
   bridge_warmup:
+    dyn_soft: 0.0
     gs_render: 1.0
     sky_alpha: 0.0
+    mask_render: 0.03
   after_stability:
+    dyn_soft: 0.0
     gs_render: 1.0
     sky_alpha: 0.0
+    mask_render: 0.05

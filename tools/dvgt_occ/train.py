@@ -249,6 +249,7 @@ def build_model_config(cfg: Dict[str, object]) -> DVGTOccConfig:
         "render_splat_radius": int(model_cfg.get("render_splat_radius", base.render_splat_radius)),
         "render_source_weight": float(model_cfg.get("render_source_weight", base.render_source_weight)),
         "render_heldout_weight": float(model_cfg.get("render_heldout_weight", base.render_heldout_weight)),
+        "render_lpips_weight": float(model_cfg.get("render_lpips_weight", base.render_lpips_weight)),
         "selected_layers": tuple(model_cfg.get("selected_layers", list(base.selected_layers))),
         "camera_view_ids": tuple(model_cfg.get("camera_view_ids", list(base.camera_view_ids))),
         "occ_grid": base.occ_grid,

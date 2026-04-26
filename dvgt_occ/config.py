@@ -55,6 +55,7 @@ class DVGTOccConfig:
     render_splat_radius: int = 4
     render_source_weight: float = 1.0
     render_heldout_weight: float = 0.1
+    render_lpips_weight: float = 0.05
     sky_hidden_dim: int = 64
     sky_fourier_freqs: int = 6
     selected_layers: Tuple[int, ...] = (4, 11, 17, 23)

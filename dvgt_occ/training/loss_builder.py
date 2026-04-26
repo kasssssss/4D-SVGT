@@ -166,8 +166,41 @@ class DVGTOccLossBuilder(nn.Module):
         return _balanced_bce_with_logits(pred, target) + _soft_dice_loss_from_logits(pred, target)
 
     def _loss_dyn_mask_full(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        train_mode = str(batch.get("_train_mode", "v1-stable"))
+        if train_mode == "v1-gs-aux" and "sam3_dyn_mask_full" in batch and outputs.get("dynamic") is not None:
+            pred_dyn = outputs["dynamic"].dyn_logit_1_4.squeeze(3)
+            target_dyn = batch["sam3_dyn_mask_full"]
+            valid = batch.get("sam3_valid_mask_full")
+            target_is_source = batch.get("target_is_source")
+            if target_is_source is not None and target_dyn.shape[2] != pred_dyn.shape[2]:
+                target_src = target_dyn.new_zeros((target_dyn.shape[0], target_dyn.shape[1], pred_dyn.shape[2], target_dyn.shape[3], target_dyn.shape[4]))
+                valid_src = None if valid is None else valid.new_zeros((valid.shape[0], valid.shape[1], pred_dyn.shape[2], valid.shape[3], valid.shape[4]))
+                for batch_idx in range(target_dyn.shape[0]):
+                    src_indices = torch.nonzero(target_is_source[batch_idx], as_tuple=False).flatten()[: pred_dyn.shape[2]]
+                    if src_indices.numel() == 0:
+                        continue
+                    take = int(src_indices.numel())
+                    target_src[batch_idx, :, :take] = target_dyn[batch_idx, :, src_indices]
+                    if valid_src is not None and valid is not None:
+                        valid_src[batch_idx, :, :take] = valid[batch_idx, :, src_indices]
+                target_dyn = target_src
+                valid = valid_src
+            b, t, v, h, w = target_dyn.shape
+            target_dyn = F.interpolate(
+                target_dyn.reshape(b * t * v, 1, h, w),
+                size=pred_dyn.shape[-2:],
+                mode="nearest",
+            ).reshape(b, t, v, pred_dyn.shape[-2], pred_dyn.shape[-1])
+            if valid is not None:
+                valid = F.interpolate(
+                    valid.reshape(b * t * v, 1, h, w).float(),
+                    size=pred_dyn.shape[-2:],
+                    mode="nearest",
+                ).reshape(b, t, v, pred_dyn.shape[-2], pred_dyn.shape[-1])
+                return _masked_balanced_bce_with_logits(pred_dyn, target_dyn, valid) + _masked_soft_dice_loss_from_logits(pred_dyn, target_dyn, valid)
+            return _balanced_bce_with_logits(pred_dyn, target_dyn) + _soft_dice_loss_from_logits(pred_dyn, target_dyn)
+
         if "sam3_dyn_mask_full" in batch and "render" in outputs:
-            train_mode = str(batch.get("_train_mode", "v1-stable"))
             mask_all_weight = float(batch.get("_mask_all_weight", 0.0))
             pred_dyn = _safe_logit(outputs["render"].render_alpha_dynamic.squeeze(3))
             target_dyn = batch["sam3_dyn_mask_full"]
@@ -222,7 +255,8 @@ class DVGTOccLossBuilder(nn.Module):
             lpips_loss = self._masked_lpips(pred, target, valid)
         else:
             lpips_loss = self._multiscale_l1(pred, target, valid)
-        lpips_weight = 0.05 * min(float(self._current_step_hint(outputs, batch)) / 1000.0, 1.0)
+        lpips_base_weight = float(getattr(self.config, "render_lpips_weight", 0.05))
+        lpips_weight = lpips_base_weight * min(float(self._current_step_hint(outputs, batch)) / 1000.0, 1.0)
         gs_conf_loss = _zero_like(l1)
         scale_reg = _zero_like(l1)
         color_sup = _zero_like(l1)
