@@ -37,6 +37,7 @@ class GSHead(nn.Module):
             nn.SiLU(),
         )
         self.head = nn.Sequential(nn.Conv2d(feature_dim, feature_dim, 3, padding=1), nn.GELU(), nn.Conv2d(feature_dim, out_dim, 1))
+        self.dynamic_head = nn.Conv2d(feature_dim, 1, 1)
         self.instance_dim = instance_dim
         self.motion_dim = motion_dim
         self.bias_scale = float(bias_scale)
@@ -68,6 +69,8 @@ class GSHead(nn.Module):
             cursor += 4
             cursor += 3  # feat_dc residual around the RGB prior.
             last.bias[cursor] = -2.0  # keep_score starts conservative.
+        nn.init.zeros_(self.dynamic_head.weight)
+        nn.init.constant_(self.dynamic_head.bias, -3.0)
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
         self.gradient_checkpointing = enabled
@@ -103,6 +106,8 @@ class GSHead(nn.Module):
         g_feat = self.post(g_feat.reshape(b * t * v, c, h, w)).reshape(b, t, v, self.feature_dim, h, w)
         raw = self.head(g_feat.reshape(b * t * v, self.feature_dim, h, w))
         raw = raw.reshape(b, t, v, raw.shape[1], h, w).permute(0, 1, 2, 4, 5, 3).contiguous()
+        dynamic_logit = self.dynamic_head(g_feat.reshape(b * t * v, self.feature_dim, h, w))
+        dynamic_logit = dynamic_logit.reshape(b, t, v, 1, h, w).permute(0, 1, 2, 4, 5, 3).contiguous()
         cursor = 0
         offset = self.offset_limit * torch.tanh(raw[..., cursor : cursor + 3])
         cursor += 3
@@ -138,4 +143,5 @@ class GSHead(nn.Module):
             instance_affinity=instance_affinity,
             motion_code=motion_code,
             aux_decoder_full=full,
+            dynamic_logit=dynamic_logit,
         )

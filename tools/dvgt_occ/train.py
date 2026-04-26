@@ -339,14 +339,14 @@ def build_loss_weights(cfg: Dict[str, object]) -> tuple[LossWeights, LossWeights
     bridge_cfg = weights_cfg.get("bridge_warmup")
     bridge = stage_c_bridge_warmup_weights()
     if bridge_cfg:
-        bridge_merged = bridge.to_dict()
+        bridge_merged = base.to_dict()
         bridge_merged.update(bridge_cfg)
         bridge = LossWeights(**bridge_merged)
 
     after_cfg = weights_cfg.get("after_stability")
     after = stage_b_after_stability_weights()
     if after_cfg:
-        after_merged = after.to_dict()
+        after_merged = base.to_dict()
         after_merged.update(after_cfg)
         after = LossWeights(**after_merged)
     return base, bridge, after
@@ -774,6 +774,10 @@ def collect_debug_metrics_with_batch(outputs: Dict[str, object], batch: Dict[str
         metrics["debug_gauss_scale_mean"] = gaussians.scale.mean()
         metrics["debug_gauss_feat_dc_mean"] = gaussians.feat_dc.mean()
         metrics["debug_gauss_feat_dc_max"] = gaussians.feat_dc.max()
+        if gaussians.dynamic_logit is not None:
+            dyn_prob = torch.sigmoid(gaussians.dynamic_logit)
+            metrics["debug_gauss_dynamic_prob_mean"] = dyn_prob.mean()
+            metrics["debug_gauss_dynamic_prob_gt_05_ratio"] = (dyn_prob > 0.5).float().mean()
         if batch is not None and "gs_global_track_id_1_8" in batch:
             gid = batch["gs_global_track_id_1_8"]
             keep = (gaussians.keep_score.squeeze(-1) > 0.1).float()
@@ -793,6 +797,10 @@ def collect_debug_metrics_with_batch(outputs: Dict[str, object], batch: Dict[str
     if render is not None:
         metrics["debug_render_alpha_coverage"] = (render.render_alpha_all > 1e-3).float().mean()
         metrics["debug_render_alpha_mean"] = render.render_alpha_all.mean()
+        metrics["debug_render_dyn_alpha_coverage"] = (render.render_alpha_dynamic > 1e-3).float().mean()
+        metrics["debug_render_dyn_alpha_mean"] = render.render_alpha_dynamic.mean()
+        metrics["debug_render_static_alpha_coverage"] = (render.render_alpha_static > 1e-3).float().mean()
+        metrics["debug_render_static_alpha_mean"] = render.render_alpha_static.mean()
         metrics["debug_render_rgb_mean"] = render.render_rgb_all.mean()
         metrics["debug_render_rgb_max"] = render.render_rgb_all.max()
         if render.debug_mean_sigma is not None:
@@ -979,8 +987,28 @@ def main() -> None:
         start_step = 0
         if runtime["resume"] is not None:
             checkpoint = torch.load(runtime["resume"], map_location=device)
-            raw_model.load_state_dict(checkpoint["model"], strict=True)
-            if os.environ.get("RESET_OPTIMIZER", "0") != "1":
+            optimizer_resume_ok = True
+            try:
+                raw_model.load_state_dict(checkpoint["model"], strict=True)
+            except RuntimeError as exc:
+                if "gs_head.dynamic_head." not in str(exc):
+                    raise
+                load_result = raw_model.load_state_dict(checkpoint["model"], strict=False)
+                missing = list(load_result.missing_keys)
+                unexpected = list(load_result.unexpected_keys)
+                allowed_missing = [key for key in missing if key.startswith("gs_head.dynamic_head.")]
+                if len(allowed_missing) != len(missing) or unexpected:
+                    raise RuntimeError(
+                        "Checkpoint can only be resumed forgivingly when the new per-Gaussian dynamic head is missing."
+                    ) from exc
+                optimizer_resume_ok = False
+                if rank == 0:
+                    print(
+                        "[resume] initialized new gs_head.dynamic_head from defaults; "
+                        "skipping optimizer state from the older checkpoint.",
+                        flush=True,
+                    )
+            if optimizer_resume_ok and os.environ.get("RESET_OPTIMIZER", "0") != "1":
                 optimizer.load_state_dict(checkpoint["optimizer"])
             start_step = int(checkpoint.get("step", -1)) + 1
 

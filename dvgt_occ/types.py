@@ -79,6 +79,7 @@ class GaussianOutput:
     instance_affinity: torch.Tensor
     motion_code: torch.Tensor
     aux_decoder_full: Optional[torch.Tensor] = None
+    dynamic_logit: Optional[torch.Tensor] = None
 
     @property
     def confidence(self) -> torch.Tensor:
@@ -87,6 +88,12 @@ class GaussianOutput:
     @property
     def gs_conf(self) -> torch.Tensor:
         return self.keep_score
+
+    @property
+    def dynamic_prob(self) -> Optional[torch.Tensor]:
+        if self.dynamic_logit is None:
+            return None
+        return torch.sigmoid(self.dynamic_logit)
 
     @property
     def gs_core_map(self) -> torch.Tensor:

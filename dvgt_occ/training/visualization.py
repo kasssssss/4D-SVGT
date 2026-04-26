@@ -304,6 +304,69 @@ def _target_panel(
     }
 
 
+def _resize_mask(mask: np.ndarray, size_hw: tuple[int, int]) -> np.ndarray:
+    mask = np.asarray(mask, dtype=np.float32)
+    image = Image.fromarray(np.clip(mask * 255.0, 0.0, 255.0).astype(np.uint8), mode="L")
+    image = image.resize((size_hw[1], size_hw[0]), Image.Resampling.BILINEAR)
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def _dynamic_panel(
+    batch: Mapping[str, object],
+    outputs: Mapping[str, object],
+    config: DVGTOccConfig,
+    sample_idx: int,
+    frame_idx: int,
+    source_view_idx: int,
+    source_rgb: np.ndarray,
+) -> dict[str, np.ndarray | float]:
+    height, width = config.image_height, config.image_width
+    pred = np.zeros((height, width), dtype=np.float32)
+    render_dyn = np.zeros((height, width), dtype=np.float32)
+    render_static = np.zeros((height, width), dtype=np.float32)
+    dynamic = outputs.get("dynamic")
+    if dynamic is not None and getattr(dynamic, "dyn_logit_1_4", None) is not None:
+        logits = dynamic.dyn_logit_1_4
+        dyn_view_idx = max(0, min(int(source_view_idx), logits.shape[2] - 1))
+        pred_low = logits[sample_idx, frame_idx, dyn_view_idx, 0].detach().cpu().float().numpy()
+        pred = _resize_mask(1.0 / (1.0 + np.exp(-pred_low)), (height, width))
+    render_out = outputs.get("render")
+    if render_out is not None and getattr(render_out, "render_alpha_dynamic", None) is not None:
+        render_dyn = render_out.render_alpha_dynamic[sample_idx, frame_idx, source_view_idx, 0].detach().cpu().float().numpy()
+    if render_out is not None and getattr(render_out, "render_alpha_static", None) is not None:
+        render_static = render_out.render_alpha_static[sample_idx, frame_idx, source_view_idx, 0].detach().cpu().float().numpy()
+    if render_out is not None and render_static.max() <= 1e-6 and getattr(render_out, "render_alpha_all", None) is not None:
+        render_all = render_out.render_alpha_all[sample_idx, frame_idx, source_view_idx, 0].detach().cpu().float().numpy()
+        render_static = np.clip(render_all - render_dyn, 0.0, 1.0)
+
+    target = np.zeros((height, width), dtype=np.float32)
+    if "sam3_dyn_mask_full" in batch:
+        gt = batch["sam3_dyn_mask_full"][sample_idx, frame_idx, source_view_idx].detach().cpu().float().numpy()
+        target = _resize_mask(gt, (height, width))
+
+    tint_pred = np.array([1.0, 0.15, 0.05], dtype=np.float32)
+    tint_gt = np.array([0.0, 0.65, 1.0], dtype=np.float32)
+    overlay = source_rgb * (1.0 - 0.45 * render_dyn[..., None])
+    overlay = overlay + tint_pred * (0.45 * render_dyn[..., None])
+    overlay = overlay * (1.0 - 0.35 * target[..., None]) + tint_gt * (0.35 * target[..., None])
+    overlay = np.clip(overlay, 0.0, 1.0)
+    inter = float(((render_dyn > 0.5) & (target > 0.5)).sum())
+    union = float(((render_dyn > 0.5) | (target > 0.5)).sum())
+    iou = inter / max(union, 1.0)
+    return {
+        "pred": pred,
+        "render_dyn": render_dyn.clip(0.0, 1.0),
+        "render_static": render_static.clip(0.0, 1.0),
+        "target": target,
+        "overlay": overlay,
+        "pred_mean": float(pred.mean()),
+        "render_dyn_mean": float(render_dyn.mean()),
+        "render_static_mean": float(render_static.mean()),
+        "target_mean": float(target.mean()),
+        "iou_t50": iou,
+    }
+
+
 def save_training_visualization(
     batch: Mapping[str, object],
     outputs: Mapping[str, object],
@@ -324,12 +387,13 @@ def save_training_visualization(
     source_view_idx, heldout_view_idx = _choose_source_and_heldout_indices(batch, sample_idx, view_idx)
     source_panel = _target_panel(batch, outputs, config, sample_idx, frame_idx, source_view_idx)
     heldout_panel = _target_panel(batch, outputs, config, sample_idx, frame_idx, heldout_view_idx)
+    dynamic_panel = _dynamic_panel(batch, outputs, config, sample_idx, frame_idx, source_view_idx, np.asarray(source_panel["rgb"]))
     audit_panel = heldout_panel if heldout_view_idx != source_view_idx else source_panel
     audit_view_idx = heldout_view_idx if heldout_view_idx != source_view_idx else source_view_idx
     abs_err = np.asarray(audit_panel["abs_err"])
     err_vmax = max(0.08, min(1.0, float(np.percentile(abs_err, 99.0)) if abs_err.size else 0.3))
 
-    fig, axes = plt.subplots(3, 3, figsize=(20, 15), constrained_layout=True)
+    fig, axes = plt.subplots(5, 3, figsize=(20, 23), constrained_layout=True)
     axes[0, 0].imshow(source_panel["rgb"])
     axes[0, 0].set_title("Source Reference RGB")
     axes[0, 0].axis("off")
@@ -366,17 +430,49 @@ def save_training_visualization(
     axes[1, 2].axis("off")
     plt.colorbar(alpha_plot, ax=axes[1, 2], shrink=0.65, fraction=0.046, pad=0.02)
 
-    axes[2, 0].imshow(audit_panel["alpha_on_ref"])
-    axes[2, 0].set_title(f"{audit_panel['kind'].title()} Alpha Coverage on Reference")
+    dyn_pred = np.asarray(dynamic_panel["pred"])
+    dyn_plot = axes[2, 0].imshow(dyn_pred, cmap="magma", vmin=0.0, vmax=1.0)
+    axes[2, 0].set_title(f"Source Dynamic Dense Pred mean={dynamic_panel['pred_mean']:.3f}")
     axes[2, 0].axis("off")
+    plt.colorbar(dyn_plot, ax=axes[2, 0], shrink=0.65, fraction=0.046, pad=0.02)
 
-    axes[2, 1].imshow(audit_panel["pred_on_gt_bg"])
-    axes[2, 1].set_title(f"{audit_panel['kind'].title()} Pred on GT Background")
+    render_dyn = np.asarray(dynamic_panel["render_dyn"])
+    render_dyn_plot = axes[2, 1].imshow(render_dyn, cmap="magma", vmin=0.0, vmax=1.0)
+    axes[2, 1].set_title(f"Source GS Dynamic Alpha mean={dynamic_panel['render_dyn_mean']:.3f}")
     axes[2, 1].axis("off")
+    plt.colorbar(render_dyn_plot, ax=axes[2, 1], shrink=0.65, fraction=0.046, pad=0.02)
 
-    axes[2, 2].imshow(audit_panel["signed_resid"])
-    axes[2, 2].set_title(f"{audit_panel['kind'].title()} Residual |err| mean={abs_err.mean():.3f} max={abs_err.max():.3f}")
+    axes[2, 2].imshow(dynamic_panel["overlay"])
+    axes[2, 2].set_title(f"GS Dynamic Overlay IoU@0.5={dynamic_panel['iou_t50']:.3f}")
     axes[2, 2].axis("off")
+
+    dyn_target = np.asarray(dynamic_panel["target"])
+    dyn_gt_plot = axes[3, 0].imshow(dyn_target, cmap="magma", vmin=0.0, vmax=1.0)
+    axes[3, 0].set_title(f"SAM3 Dynamic GT mean={dynamic_panel['target_mean']:.3f}")
+    axes[3, 0].axis("off")
+    plt.colorbar(dyn_gt_plot, ax=axes[3, 0], shrink=0.65, fraction=0.046, pad=0.02)
+
+    render_static = np.asarray(dynamic_panel["render_static"])
+    render_static_plot = axes[3, 1].imshow(render_static, cmap="magma", vmin=0.0, vmax=1.0)
+    axes[3, 1].set_title(f"Source GS Static Alpha mean={dynamic_panel['render_static_mean']:.3f}")
+    axes[3, 1].axis("off")
+    plt.colorbar(render_static_plot, ax=axes[3, 1], shrink=0.65, fraction=0.046, pad=0.02)
+
+    axes[3, 2].imshow(source_panel["alpha_on_ref"])
+    axes[3, 2].set_title("Source Alpha Coverage on Reference")
+    axes[3, 2].axis("off")
+
+    axes[4, 0].imshow(audit_panel["alpha_on_ref"])
+    axes[4, 0].set_title(f"{audit_panel['kind'].title()} Alpha Coverage on Reference")
+    axes[4, 0].axis("off")
+
+    axes[4, 1].imshow(audit_panel["pred_on_gt_bg"])
+    axes[4, 1].set_title(f"{audit_panel['kind'].title()} Pred on GT Background")
+    axes[4, 1].axis("off")
+
+    axes[4, 2].imshow(audit_panel["signed_resid"])
+    axes[4, 2].set_title(f"{audit_panel['kind'].title()} Residual |err| mean={abs_err.mean():.3f} max={abs_err.max():.3f}")
+    axes[4, 2].axis("off")
 
     scene_id = batch["scene_id"][sample_idx]
     clip_id = batch["clip_id"][sample_idx]

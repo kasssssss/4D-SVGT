@@ -37,6 +37,7 @@ class GaussianMultiViewMerge(nn.Module):
         keep_score = gaussians.keep_score.clone()
         instance_affinity = gaussians.instance_affinity.clone()
         motion_code = gaussians.motion_code.clone()
+        dynamic_logit = gaussians.dynamic_logit.clone() if gaussians.dynamic_logit is not None else None
 
         b, t, v, h, w = global_track_id.shape
         for batch_idx in range(b):
@@ -75,6 +76,7 @@ class GaussianMultiViewMerge(nn.Module):
                     dense_vals = dense_feat[batch_idx, time_idx, sel_v, sel_h, sel_w]
                     instance_vals = instance_affinity[batch_idx, time_idx, sel_v, sel_h, sel_w]
                     motion_vals = motion_code[batch_idx, time_idx, sel_v, sel_h, sel_w]
+                    dynamic_vals = dynamic_logit[batch_idx, time_idx, sel_v, sel_h, sel_w] if dynamic_logit is not None else None
 
                     weight_view = weights[:, None]
                     mean_center = (center_vals * weight_view).sum(dim=0).to(center.dtype)
@@ -87,6 +89,11 @@ class GaussianMultiViewMerge(nn.Module):
                     mean_dense = (dense_vals * weight_view).sum(dim=0).to(dense_feat.dtype)
                     mean_instance = (instance_vals * weight_view).sum(dim=0).to(instance_affinity.dtype)
                     mean_motion = (motion_vals * weight_view).sum(dim=0).to(motion_code.dtype)
+                    mean_dynamic = (
+                        (dynamic_vals * weight_view).sum(dim=0).to(dynamic_logit.dtype)
+                        if dynamic_vals is not None and dynamic_logit is not None
+                        else None
+                    )
 
                     center[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_center
                     dense_feat[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_dense
@@ -98,6 +105,8 @@ class GaussianMultiViewMerge(nn.Module):
                     keep_score[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_keep
                     instance_affinity[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_instance
                     motion_code[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_motion
+                    if dynamic_logit is not None and mean_dynamic is not None:
+                        dynamic_logit[batch_idx, time_idx, rep_v, rep_h, rep_w] = mean_dynamic
 
                     dup_mask = torch.ones_like(sel_v, dtype=torch.bool)
                     dup_mask[rep_idx] = False
@@ -115,6 +124,8 @@ class GaussianMultiViewMerge(nn.Module):
                         keep_score[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_keep * self.duplicate_keep_scale
                         instance_affinity[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_instance
                         motion_code[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_motion
+                        if dynamic_logit is not None and mean_dynamic is not None:
+                            dynamic_logit[batch_idx, time_idx, dup_v, dup_h, dup_w] = mean_dynamic
 
         return GaussianOutput(
             dense_feat=dense_feat,
@@ -128,4 +139,5 @@ class GaussianMultiViewMerge(nn.Module):
             instance_affinity=instance_affinity,
             motion_code=motion_code,
             aux_decoder_full=gaussians.aux_decoder_full,
+            dynamic_logit=dynamic_logit,
         )

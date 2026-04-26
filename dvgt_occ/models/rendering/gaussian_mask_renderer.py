@@ -45,8 +45,12 @@ class GaussianMaskRenderer(nn.Module):
         # darker without matching DGGT's training behavior.
         base_alpha = opacity.clamp(0.0, 1.0)
 
-        background = assignment.background_prob.reshape(b, t, v, h, w)
-        dynamicness = (1.0 - background).clamp(0.0, 1.0)
+        dynamic_prob = gaussians.dynamic_prob
+        if dynamic_prob is not None:
+            dynamicness = dynamic_prob.squeeze(-1).clamp(0.0, 1.0)
+        else:
+            background = assignment.background_prob.reshape(b, t, v, h, w)
+            dynamicness = (1.0 - background).clamp(0.0, 1.0)
         alpha_all = base_alpha
         alpha_dyn = base_alpha * dynamicness
         alpha_sta = base_alpha * (1.0 - dynamicness)

@@ -570,6 +570,9 @@ class DVGTOccLossBuilder(nn.Module):
         gs_aux = getattr(gaussians, "aux_decoder_full", None)
         if gs_aux is not None:
             tether = tether + gs_aux.sum() * 0.0
+        gs_dynamic_logit = getattr(gaussians, "dynamic_logit", None)
+        if gs_dynamic_logit is not None:
+            tether = tether + gs_dynamic_logit.sum() * 0.0
         bridges = outputs.get("bridges")
         if bridges is not None:
             tether = tether + bridges.gs_to_occ_local.sum() * 0.0
