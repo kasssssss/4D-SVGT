@@ -197,8 +197,11 @@ class DVGTOccLossBuilder(nn.Module):
                     size=pred_dyn.shape[-2:],
                     mode="nearest",
                 ).reshape(b, t, v, pred_dyn.shape[-2], pred_dyn.shape[-1])
-                return _masked_balanced_bce_with_logits(pred_dyn, target_dyn, valid) + _masked_soft_dice_loss_from_logits(pred_dyn, target_dyn, valid)
-            return _balanced_bce_with_logits(pred_dyn, target_dyn) + _soft_dice_loss_from_logits(pred_dyn, target_dyn)
+                loss_dense_dyn = _masked_balanced_bce_with_logits(pred_dyn, target_dyn, valid) + _masked_soft_dice_loss_from_logits(pred_dyn, target_dyn, valid)
+            else:
+                loss_dense_dyn = _balanced_bce_with_logits(pred_dyn, target_dyn) + _soft_dice_loss_from_logits(pred_dyn, target_dyn)
+            loss_gauss_dyn = self._loss_gaussian_dynamic_logits(outputs, batch)
+            return loss_dense_dyn + 1.0 * loss_gauss_dyn
 
         if "sam3_dyn_mask_full" in batch and "render" in outputs:
             mask_all_weight = float(batch.get("_mask_all_weight", 0.0))
