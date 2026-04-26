@@ -209,6 +209,8 @@ class DVGTOccLossBuilder(nn.Module):
                 loss_dyn = _masked_balanced_bce_with_logits(pred_dyn, target_dyn, valid) + _masked_soft_dice_loss_from_logits(pred_dyn, target_dyn, valid)
             else:
                 loss_dyn = _balanced_bce_with_logits(pred_dyn, target_dyn) + _soft_dice_loss_from_logits(pred_dyn, target_dyn)
+            loss_gauss_dyn = self._loss_gaussian_dynamic_logits(outputs, batch)
+            loss_dyn = loss_dyn + 0.5 * loss_gauss_dyn
             if train_mode == "v1-stable" or mask_all_weight <= 0.0:
                 return loss_dyn
             pred_all = _safe_logit(outputs["render"].render_alpha_all.squeeze(3))
@@ -229,6 +231,46 @@ class DVGTOccLossBuilder(nn.Module):
             align_corners=False,
         ).reshape(b, t, v, pred.shape[-2], pred.shape[-1])
         return _balanced_bce_with_logits(pred, target_full) + _soft_dice_loss_from_logits(pred, target_full)
+
+    def _loss_gaussian_dynamic_logits(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        gaussians = outputs.get("gaussians")
+        dyn_logit = getattr(gaussians, "dynamic_logit", None)
+        if dyn_logit is None or "sam3_dyn_mask_full" not in batch:
+            return _zero_like(outputs["dynamic"].dyn_logit_1_4)
+        pred = dyn_logit.squeeze(-1)
+        target = batch["sam3_dyn_mask_full"]
+        valid = batch.get("sam3_valid_mask_full")
+        target_is_source = batch.get("target_is_source")
+        if target_is_source is not None and target.shape[2] != pred.shape[2]:
+            target_src = target.new_zeros((target.shape[0], target.shape[1], pred.shape[2], target.shape[3], target.shape[4]))
+            valid_src = None if valid is None else valid.new_zeros((valid.shape[0], valid.shape[1], pred.shape[2], valid.shape[3], valid.shape[4]))
+            for batch_idx in range(target.shape[0]):
+                src_indices = torch.nonzero(target_is_source[batch_idx], as_tuple=False).flatten()[: pred.shape[2]]
+                if src_indices.numel() == 0:
+                    continue
+                take = int(src_indices.numel())
+                target_src[batch_idx, :, :take] = target[batch_idx, :, src_indices]
+                if valid_src is not None and valid is not None:
+                    valid_src[batch_idx, :, :take] = valid[batch_idx, :, src_indices]
+            target = target_src
+            valid = valid_src
+        elif target.shape[2] != pred.shape[2]:
+            target = target[:, :, : pred.shape[2]]
+            valid = None if valid is None else valid[:, :, : pred.shape[2]]
+        b, t, v, h, w = target.shape
+        target = F.interpolate(
+            target.reshape(b * t * v, 1, h, w).float(),
+            size=pred.shape[-2:],
+            mode="nearest",
+        ).reshape(b, t, v, pred.shape[-2], pred.shape[-1])
+        if valid is not None:
+            valid = F.interpolate(
+                valid.reshape(b * t * v, 1, h, w).float(),
+                size=pred.shape[-2:],
+                mode="nearest",
+            ).reshape(b, t, v, pred.shape[-2], pred.shape[-1])
+            return _masked_balanced_bce_with_logits(pred, target, valid) + _masked_soft_dice_loss_from_logits(pred, target, valid)
+        return _balanced_bce_with_logits(pred, target) + _soft_dice_loss_from_logits(pred, target)
 
     def _loss_gs_render(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         if "render" not in outputs or "rgb_target" not in batch:
