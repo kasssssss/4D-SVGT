@@ -2,7 +2,7 @@
 
 `4D-SVGT` is my thesis codebase for instance-aware 4D driving scene modeling built on top of DVGT. The project couples:
 
-- frozen DVGT geometry cache
+- online frozen DVGT geometry frontend, with cache kept only for debug/sanity/ablation
 - scene-level SAM3 video masks with cross-window stitching
 - global weak instance supervision from 3D tracks
 - occupancy prediction and Gaussian scene modeling
@@ -13,7 +13,7 @@ The current repository is focused on turning that research plan into a trainable
 
 This repo is not a clean re-release of upstream DVGT. It is a working thesis branch that keeps the original DVGT code where useful and adds a parallel `dvgt_occ` pipeline for:
 
-- Stage-A data preparation and caching
+- Stage-A data preparation plus optional debug caching
 - scene-level SAM3 mask generation and clip-level supervision building
 - dynamic query / Gaussian / occupancy model wiring
 - pilot training, evaluation, and visualization

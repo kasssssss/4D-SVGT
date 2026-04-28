@@ -40,7 +40,10 @@ class DVGTOccModel(nn.Module):
             out_dim=config.neck_dim,
             patch_grid=config.patch_grid,
         )
-        self.dynamic_dense = DynamicDenseBranch(channels=config.neck_dim, full_channels=config.full_dim)
+        full_size = (config.image_height, config.image_width)
+        quarter_size = (max(1, config.image_height // 4), max(1, config.image_width // 4))
+        eighth_size = (max(1, config.image_height // 8), max(1, config.image_width // 8))
+        self.dynamic_dense = DynamicDenseBranch(channels=config.neck_dim, full_channels=config.full_dim, output_size=full_size)
         self.occ_head = OccHead(
             channels=config.neck_dim,
             semantic_classes=config.semantic_classes,
@@ -52,6 +55,7 @@ class DVGTOccModel(nn.Module):
             y_range=config.occ_grid.y_range,
             z_range=config.occ_grid.z_range,
             voxel_size=config.occ_grid.voxel_size,
+            output_size=full_size,
         )
         self.dynamic_query = DynamicQueryDecoder(
             query_dim=config.dynamic_query_dim,
@@ -60,7 +64,7 @@ class DVGTOccModel(nn.Module):
             dynamic_classes=config.dynamic_classes,
             motion_dim=7,
             local_feature_dim=config.dynamic_dense_dim,
-            local_topk=min(config.sparse_dynamic_anchors, config.num_views * 56 * 112),
+            local_topk=min(config.sparse_dynamic_anchors, config.num_views * quarter_size[0] * quarter_size[1]),
             occ_samples_per_scale=config.occ_samples_per_scale,
             x_range=config.occ_grid.x_range,
             y_range=config.occ_grid.y_range,
@@ -72,6 +76,12 @@ class DVGTOccModel(nn.Module):
             instance_dim=config.instance_dim,
             motion_dim=config.motion_dim,
             bias_scale=config.gs_bias_scale,
+            init_scale=config.gs_init_scale,
+            init_opacity_logit=config.gs_init_opacity_logit,
+            anchor_jitter_m=config.gs_anchor_jitter_m,
+            output_level=config.gs_output_level,
+            scale_multiplier=config.gs_scale_multiplier,
+            output_size=full_size,
         )
         self.gaussian_merge = GaussianMultiViewMerge()
         self.gaussian_assignment = GaussianQueryAssignment(
@@ -106,6 +116,12 @@ class DVGTOccModel(nn.Module):
         self.mask_renderer = GaussianMaskRenderer(
             output_size=(config.image_height, config.image_width),
             splat_radius=config.render_splat_radius,
+            scale_max=config.render_scale_max,
+            rasterize_mode=config.render_rasterize_mode,
+            keep_score_gate=config.render_keep_score_gate,
+            keep_topk_ratio=config.render_keep_topk_ratio,
+            anti_grid_replicas=config.render_antigrid_replicas,
+            anti_grid_jitter_m=config.render_antigrid_jitter_m,
         )
         self.sky_model = SkyRayBackground(
             hidden_dim=config.sky_hidden_dim,
@@ -155,19 +171,31 @@ class DVGTOccModel(nn.Module):
 
         points = batch["points"]
         points_conf = batch["points_conf"]
-        xyz_1_4 = self._downsample_points(points, size=(56, 112))
-        conf_1_4 = self._downsample_conf(points_conf, size=(56, 112))
-        xyz_1_8 = self._downsample_points(points, size=(28, 56))
-        conf_1_8 = self._downsample_conf(points_conf, size=(28, 56))
+        quarter_size = (max(1, self.config.image_height // 4), max(1, self.config.image_width // 4))
+        eighth_size = (max(1, self.config.image_height // 8), max(1, self.config.image_width // 8))
+        xyz_1_4 = self._downsample_points(points, size=quarter_size)
+        conf_1_4 = self._downsample_conf(points_conf, size=quarter_size)
+        xyz_1_8 = self._downsample_points(points, size=eighth_size)
+        conf_1_8 = self._downsample_conf(points_conf, size=eighth_size)
         rgb_for_gs = batch.get("source_rgb", batch.get("rgb_source", batch.get("rgb_target")))
+        use_full_res_gs = str(getattr(self.config, "gs_output_level", "p2")).lower() == "full"
+        if use_full_res_gs:
+            xyz_gs = points.permute(0, 1, 2, 5, 3, 4).contiguous()
+            conf_gs = points_conf[:, :, :, None].contiguous()
+            rgb_gs = rgb_for_gs
+        else:
+            xyz_gs = xyz_1_4
+            conf_gs = conf_1_4
+            rgb_gs = None
         if rgb_for_gs is not None:
             b_r, t_r, v_r, c_r, h_r, w_r = rgb_for_gs.shape
-            rgb_1_4 = F.interpolate(
-                rgb_for_gs.reshape(b_r * t_r * v_r, c_r, h_r, w_r),
-                size=(56, 112), mode="bilinear", align_corners=False,
-            ).reshape(b_r, t_r, v_r, c_r, 56, 112)
+            if rgb_gs is None:
+                rgb_gs = F.interpolate(
+                    rgb_for_gs.reshape(b_r * t_r * v_r, c_r, h_r, w_r),
+                    size=quarter_size, mode="bilinear", align_corners=False,
+                ).reshape(b_r, t_r, v_r, c_r, quarter_size[0], quarter_size[1])
         else:
-            rgb_1_4 = None
+            rgb_gs = None
         features = None
         if need_features:
             with torch.autograd.profiler.record_function("dvgt_occ/reassembly"):
@@ -211,15 +239,16 @@ class DVGTOccModel(nn.Module):
                     lambda: self.gs_head(
                         gs_features,
                         dynamic=dynamic if use_gs_aux else None,
-                        xyz_1_4=xyz_1_4,
-                        conf_1_4=conf_1_4,
-                        rgb_1_4=rgb_1_4,
+                        xyz_1_4=xyz_gs,
+                        conf_1_4=conf_gs,
+                        rgb_1_4=rgb_gs,
                     ),
                 )
             with torch.autograd.profiler.record_function("dvgt_occ/gaussian_merge"):
                 gaussians_merged = _record_timing("gaussian_merge", lambda: self.gaussian_merge(gaussians, global_track_id=None))
             dummy_assignment = self._build_dummy_assignment(gaussians_merged)
             dummy_sem_proj_2d = self._build_dummy_sem_proj(batch, gaussians_merged.center.dtype)
+            candidate_view_mask = self._build_source_view_candidate_mask(batch, gaussians_merged) if self.config.source_render_own_view_only else None
             with torch.autograd.profiler.record_function("dvgt_occ/mask_renderer"):
                 render = _record_timing(
                     "mask_renderer",
@@ -232,6 +261,7 @@ class DVGTOccModel(nn.Module):
                         first_ego_pose_world=batch["first_ego_pose_world"],
                         compute_static_branch=False,
                         compute_dynamic_rgb=False,
+                        candidate_view_mask=candidate_view_mask,
                     ),
                 )
             outputs = {
@@ -267,7 +297,7 @@ class DVGTOccModel(nn.Module):
                 ),
             )
         with torch.autograd.profiler.record_function("dvgt_occ/gs_head"):
-            gaussians = _record_timing("gs_head", lambda: self.gs_head(gs_features, dynamic=dynamic, xyz_1_4=xyz_1_4, conf_1_4=conf_1_4, rgb_1_4=rgb_1_4))
+            gaussians = _record_timing("gs_head", lambda: self.gs_head(gs_features, dynamic=dynamic, xyz_1_4=xyz_gs, conf_1_4=conf_gs, rgb_1_4=rgb_gs))
         global_track_id = batch.get("gs_global_track_id_1_4")
         with torch.autograd.profiler.record_function("dvgt_occ/gaussian_merge"):
             gaussians_merged = _record_timing("gaussian_merge", lambda: self.gaussian_merge(gaussians, global_track_id=global_track_id))
@@ -290,6 +320,7 @@ class DVGTOccModel(nn.Module):
                 ),
             )
         with torch.autograd.profiler.record_function("dvgt_occ/mask_renderer"):
+            candidate_view_mask = self._build_source_view_candidate_mask(batch, gaussians_merged) if self.config.source_render_own_view_only else None
             render = _record_timing(
                 "mask_renderer",
                 lambda: self.mask_renderer(
@@ -301,6 +332,7 @@ class DVGTOccModel(nn.Module):
                     first_ego_pose_world=batch["first_ego_pose_world"],
                     compute_static_branch=render_full_branches,
                     compute_dynamic_rgb=render_full_branches,
+                    candidate_view_mask=candidate_view_mask,
                 ),
             )
         outputs = {
@@ -330,6 +362,12 @@ class DVGTOccModel(nn.Module):
         train_mode = str(batch.get("_train_mode", "v1-stable"))
         active_loss_weights = batch.get("_active_loss_weights", {})
         sky_alpha_active = isinstance(active_loss_weights, dict) and float(active_loss_weights.get("sky_alpha", 0.0)) > 0.0
+        if (
+            not bool(getattr(self.config, "render_enable_sky_background", True))
+            and self.train_target != "sky_only"
+            and train_mode != "v1-sky-ablation"
+        ):
+            return None
         if train_mode != "v1-sky-ablation" and self.train_target != "sky_only" and not sky_alpha_active:
             return None
         camera_intrinsics = batch.get("camera_intrinsics")
@@ -345,6 +383,31 @@ class DVGTOccModel(nn.Module):
             render_rgb_background=sky_rgb,
             sky_mask_full=batch.get("sky_mask_full"),
         )
+
+    def _build_source_view_candidate_mask(self, batch: dict, gaussians) -> torch.Tensor | None:
+        source_view_ids = batch.get("source_view_ids")
+        target_view_ids = batch.get("target_view_ids", batch.get("view_ids"))
+        if source_view_ids is None or target_view_ids is None or "camera_to_world" not in batch:
+            return None
+        batch_size = gaussians.center.shape[0]
+        source_views = gaussians.center.shape[2]
+        target_views = batch["camera_to_world"].shape[2]
+        mask = torch.ones(
+            (batch_size, target_views, source_views),
+            device=gaussians.center.device,
+            dtype=gaussians.center.dtype,
+        )
+        for batch_idx in range(batch_size):
+            src_ids = [int(view_id) for view_id in source_view_ids[batch_idx]]
+            tgt_ids = [int(view_id) for view_id in target_view_ids[batch_idx]]
+            src_index = {view_id: idx for idx, view_id in enumerate(src_ids[:source_views])}
+            for target_idx, target_view_id in enumerate(tgt_ids[:target_views]):
+                own_idx = src_index.get(target_view_id)
+                if own_idx is None:
+                    continue
+                mask[batch_idx, target_idx].zero_()
+                mask[batch_idx, target_idx, own_idx] = 1.0
+        return mask
 
     def _run_bridges(self, gaussians, occ) -> BridgeOutput:
         gs_features = torch.cat([gaussians.instance_affinity, gaussians.motion_code], dim=-1)

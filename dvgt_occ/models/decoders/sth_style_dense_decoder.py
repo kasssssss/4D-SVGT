@@ -94,11 +94,14 @@ class STHStyleDenseDecoder(nn.Module):
         self,
         channels: int = 256,
         full_channels: int = 128,
+        output_size: tuple[int, int] = (224, 448),
         num_attention_heads: int = 8,
         num_attention_blocks: int = 2,
         max_frames: int = 32,
     ) -> None:
         super().__init__()
+        self.output_size = (int(output_size[0]), int(output_size[1]))
+        self.half_size = (max(1, self.output_size[0] // 2), max(1, self.output_size[1] // 2))
         self.temporal_f3 = TemporalModule(
             channels,
             num_heads=num_attention_heads,
@@ -137,11 +140,11 @@ class STHStyleDenseDecoder(nn.Module):
         p3 = self.refine3(h3 + h3_pre, size=f2.shape[-2:])
         h2 = self.temporal_path3(p3)
         p2 = self.refine2(h2 + f2, size=f1.shape[-2:])
-        p1 = self.refine1(p2 + f1, size=(112, 224))
+        p1 = self.refine1(p2 + f1, size=self.half_size)
         b, t, v, c, h, w = p1.shape
         full = self.full(p1.reshape(b * t * v, c, h, w))
-        full = F.interpolate(full, size=(224, 448), mode="bilinear", align_corners=False)
-        full = full.reshape(b, t, v, full.shape[1], 224, 448)
+        full = F.interpolate(full, size=self.output_size, mode="bilinear", align_corners=False)
+        full = full.reshape(b, t, v, full.shape[1], self.output_size[0], self.output_size[1])
         return h2, p2, full
 
 

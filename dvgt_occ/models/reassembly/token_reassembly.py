@@ -38,12 +38,17 @@ class TokenReassembly(nn.Module):
             tokens = aggregated_tokens[layer]
             projected.append(self._project(tokens, raw_patch_tokens, self.projections[str(layer)]))
 
-        # The selected DVGT layers are single-scale patch grids. We expose a DPT
-        # style pyramid so each downstream head receives the same contract.
-        f1 = F.interpolate(projected[0], size=(56, 112), mode="bilinear", align_corners=False)
-        f2 = F.interpolate(projected[1], size=(28, 56), mode="bilinear", align_corners=False)
+        # The selected DVGT layers are single-scale patch grids. Expose a DPT
+        # style pyramid relative to the configured patch grid instead of the
+        # old 224x448-only constants.
+        hp, wp = self.patch_grid
+        f1_size = (hp * 4, wp * 4)
+        f2_size = (hp * 2, wp * 2)
+        f4_size = (max(1, hp // 2), max(1, wp // 2))
+        f1 = F.interpolate(projected[0], size=f1_size, mode="bilinear", align_corners=False)
+        f2 = F.interpolate(projected[1], size=f2_size, mode="bilinear", align_corners=False)
         f3 = projected[2]
-        f4 = F.interpolate(projected[3], size=(7, 14), mode="bilinear", align_corners=False)
+        f4 = F.interpolate(projected[3], size=f4_size, mode="bilinear", align_corners=False)
         return ReassembledFeatures(
             f1=self._unflatten(f1, aggregated_tokens[self.selected_layers[0]]),
             f2=self._unflatten(f2, aggregated_tokens[self.selected_layers[0]]),

@@ -24,9 +24,10 @@ class OccHead(nn.Module):
         y_range=(-40.0, 40.0),
         z_range=(-2.0, 6.0),
         voxel_size: float = 0.8,
+        output_size: tuple[int, int] = (224, 448),
     ) -> None:
         super().__init__()
-        self.decoder = OccDenseDecoder(channels=channels, full_channels=128)
+        self.decoder = OccDenseDecoder(channels=channels, full_channels=128, output_size=output_size)
         self.gradient_checkpointing = False
         self.lift = Lift2DTo3D(
             channels=lift_channels,

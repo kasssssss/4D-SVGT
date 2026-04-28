@@ -16,10 +16,26 @@ except ImportError as exc:  # pragma: no cover - runtime dependency in training 
 
 
 class GaussianMaskRenderer(nn.Module):
-    def __init__(self, output_size: tuple[int, int] = (224, 448), splat_radius: int = 2) -> None:
+    def __init__(
+        self,
+        output_size: tuple[int, int] = (224, 448),
+        splat_radius: int = 2,
+        scale_max: float = 0.30,
+        rasterize_mode: str = "classic",
+        keep_score_gate: float = 0.0,
+        keep_topk_ratio: float = 0.0,
+        anti_grid_replicas: int = 1,
+        anti_grid_jitter_m: float = 0.0,
+    ) -> None:
         super().__init__()
         self.output_size = output_size
         self.splat_radius = max(int(splat_radius), 1)
+        self.scale_max = float(scale_max)
+        self.rasterize_mode = str(rasterize_mode)
+        self.keep_score_gate = float(keep_score_gate)
+        self.keep_topk_ratio = float(keep_topk_ratio)
+        self.anti_grid_replicas = max(int(anti_grid_replicas), 1)
+        self.anti_grid_jitter_m = max(float(anti_grid_jitter_m), 0.0)
 
     def forward(
         self,
@@ -32,18 +48,20 @@ class GaussianMaskRenderer(nn.Module):
         *,
         compute_static_branch: bool = True,
         compute_dynamic_rgb: bool = True,
+        candidate_view_mask: torch.Tensor | None = None,
     ) -> RenderOutput:
         if rasterization is None:
             detail = f" ({_GSPLAT_IMPORT_ERROR!r})" if _GSPLAT_IMPORT_ERROR is not None else ""
             raise ImportError(f"gsplat.rendering.rasterization is required for Gaussian rendering{detail}.")
 
         b, t, v, h, w = gaussians.opacity.shape[:5]
-        opacity = gaussians.opacity.squeeze(-1)
-        # Mirror DGGT's render contract: gs_conf / keep_score is optimized via a
-        # separate lifespan-style regularizer, not multiplied directly into the
-        # rasterized opacity. Doing the multiplication here made the render path
-        # darker without matching DGGT's training behavior.
-        base_alpha = opacity.clamp(0.0, 1.0)
+        opacity = gaussians.opacity.squeeze(-1).clamp(0.0, 1.0)
+        if self.keep_score_gate > 0.0:
+            gate = max(0.0, min(self.keep_score_gate, 1.0))
+            keep = gaussians.keep_score.squeeze(-1).clamp(0.0, 1.0)
+            base_alpha = opacity * ((1.0 - gate) + gate * keep)
+        else:
+            base_alpha = opacity
 
         dynamic_prob = gaussians.dynamic_prob
         if dynamic_prob is not None:
@@ -64,6 +82,7 @@ class GaussianMaskRenderer(nn.Module):
             camera_intrinsics,
             camera_to_world,
             first_ego_pose_world,
+            candidate_view_mask=candidate_view_mask,
             return_rgb=True,
         )
         rgb_dyn, render_alpha_dyn, _, _ = self._render_branch(
@@ -75,6 +94,7 @@ class GaussianMaskRenderer(nn.Module):
             camera_intrinsics,
             camera_to_world,
             first_ego_pose_world,
+            candidate_view_mask=candidate_view_mask,
             return_rgb=compute_dynamic_rgb,
         )
         if compute_static_branch:
@@ -87,6 +107,7 @@ class GaussianMaskRenderer(nn.Module):
                 camera_intrinsics,
                 camera_to_world,
                 first_ego_pose_world,
+                candidate_view_mask=candidate_view_mask,
                 return_rgb=True,
             )
         else:
@@ -115,6 +136,7 @@ class GaussianMaskRenderer(nn.Module):
         camera_to_world: torch.Tensor,
         first_ego_pose_world: torch.Tensor,
         *,
+        candidate_view_mask: torch.Tensor | None,
         return_rgb: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         b, t, v, h, w, _ = centers.shape
@@ -143,10 +165,17 @@ class GaussianMaskRenderer(nn.Module):
                     first_rot_quat[batch_idx].unsqueeze(0).expand(n_total, -1),
                     rotations[batch_idx, time_idx].reshape(-1, 4).float(),
                 )
-                scales_v = scales[batch_idx, time_idx].reshape(-1, 3).clamp(1e-4, 0.30).float()
+                scales_v = scales[batch_idx, time_idx].reshape(-1, 3).clamp_min(1e-4).float()
+                if self.scale_max > 0.0:
+                    scales_v = scales_v.clamp(max=self.scale_max)
                 colors_v = colors[batch_idx, time_idx].reshape(-1, 3).clamp(0.0, 1.0).float()
                 for view_idx in range(num_views):
                     opacities = alpha[batch_idx, time_idx].reshape(-1).clamp(0.0, 1.0).float()
+                    if candidate_view_mask is not None:
+                        view_keep = candidate_view_mask[batch_idx, view_idx].to(device=device, dtype=opacities.dtype)
+                        if view_keep.numel() == v:
+                            view_keep = view_keep.reshape(v, 1, 1).expand(v, h, w).reshape(-1)
+                            opacities = opacities * view_keep
 
                     viewmat = torch.linalg.inv(camera_to_world[batch_idx, time_idx, view_idx:view_idx+1].float())
                     k = self._build_k_mats(camera_intrinsics[batch_idx, view_idx:view_idx+1])
@@ -200,6 +229,20 @@ class GaussianMaskRenderer(nn.Module):
         )
         camera_z = (viewmats[0].float() @ means_h.t()).t()[:, 2]
         valid = valid & torch.isfinite(camera_z) & (camera_z.abs() > 0.5)
+        if 0.0 < self.keep_topk_ratio < 1.0 and torch.any(valid):
+            valid_idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            keep_n = max(1, int(round(float(valid_idx.numel()) * self.keep_topk_ratio)))
+            if keep_n < int(valid_idx.numel()):
+                score = opacities[valid_idx].detach()
+                # Break the uniform-initialization tie without introducing
+                # stochastic render noise; otherwise top-k picks a rectangular
+                # prefix of the 56x112 lattice and preserves the grid artifact.
+                idx_f = valid_idx.to(dtype=torch.float32)
+                tie_break = torch.frac(torch.sin((idx_f + 1.0) * 12.9898) * 43758.5453) * 1.0e-4
+                _, local_keep = torch.topk(score + tie_break.to(score.device), k=keep_n, largest=True, sorted=False)
+                pruned_valid = torch.zeros_like(valid)
+                pruned_valid[valid_idx[local_keep]] = True
+                valid = pruned_valid
         if not torch.any(valid):
             num_views = viewmats.shape[0]
             zero_rgb = torch.zeros((num_views, 3, height, width), device=device, dtype=means_world.dtype)
@@ -212,18 +255,35 @@ class GaussianMaskRenderer(nn.Module):
         scl = scales[valid]
         opa = opacities[valid]
         cols = colors[valid] if return_rgb else torch.zeros_like(colors[valid])
-
-        renders, alphas, aux = rasterization(
+        means, quats, scl, opa, cols = self._expand_antigrid_replicas(
             means=means,
             quats=quats,
             scales=scl,
             opacities=opa,
             colors=cols,
             viewmats=viewmats,
-            Ks=ks,
-            width=width,
-            height=height,
         )
+
+        raster_kwargs = {
+            "means": means,
+            "quats": quats,
+            "scales": scl,
+            "opacities": opa,
+            "colors": cols,
+            "viewmats": viewmats,
+            "Ks": ks,
+            "width": width,
+            "height": height,
+        }
+        if self.rasterize_mode and self.rasterize_mode != "classic":
+            raster_kwargs["rasterize_mode"] = self.rasterize_mode
+        try:
+            renders, alphas, aux = rasterization(**raster_kwargs)
+        except TypeError as exc:
+            if "rasterize_mode" not in raster_kwargs:
+                raise
+            raster_kwargs.pop("rasterize_mode")
+            renders, alphas, aux = rasterization(**raster_kwargs)
         renders = renders.permute(0, 3, 1, 2).contiguous()
         alphas = alphas.permute(0, 3, 1, 2).contiguous()
         if not return_rgb:
@@ -236,6 +296,49 @@ class GaussianMaskRenderer(nn.Module):
                 sigma_mean = radii.float().mean()
         touch_ratio = (alphas > 1e-6).float().mean()
         return renders, alphas, sigma_mean, touch_ratio
+
+    def _expand_antigrid_replicas(
+        self,
+        *,
+        means: torch.Tensor,
+        quats: torch.Tensor,
+        scales: torch.Tensor,
+        opacities: torch.Tensor,
+        colors: torch.Tensor,
+        viewmats: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        replicas = self.anti_grid_replicas
+        jitter_m = self.anti_grid_jitter_m
+        if replicas <= 1 or jitter_m <= 0.0 or means.numel() == 0:
+            return means, quats, scales, opacities, colors
+
+        n = means.shape[0]
+        device = means.device
+        dtype = means.dtype
+        cam_to_world = torch.linalg.inv(viewmats[0].float())
+        right = torch.nn.functional.normalize(cam_to_world[:3, 0], dim=0).to(device=device, dtype=dtype)
+        up = torch.nn.functional.normalize(cam_to_world[:3, 1], dim=0).to(device=device, dtype=dtype)
+
+        idx = torch.arange(n, device=device, dtype=torch.float32)
+        offsets = []
+        for replica_idx in range(replicas):
+            if replica_idx == 0:
+                jx = torch.zeros_like(idx)
+                jy = torch.zeros_like(idx)
+            else:
+                salt_x = 12.9898 + 19.19 * float(replica_idx)
+                salt_y = 78.2330 + 37.37 * float(replica_idx)
+                jx = torch.frac(torch.sin((idx + 1.0) * salt_x) * 43758.5453) * 2.0 - 1.0
+                jy = torch.frac(torch.sin((idx + 1.0) * salt_y) * 24634.6345) * 2.0 - 1.0
+            offsets.append((jx[:, None].to(dtype) * right + jy[:, None].to(dtype) * up) * jitter_m)
+        jitter = torch.stack(offsets, dim=1)
+
+        means_rep = (means[:, None, :] + jitter).reshape(n * replicas, 3)
+        quats_rep = quats[:, None, :].expand(n, replicas, 4).reshape(n * replicas, 4)
+        scales_rep = scales[:, None, :].expand(n, replicas, 3).reshape(n * replicas, 3)
+        opacities_rep = (opacities[:, None].expand(n, replicas) / float(replicas)).reshape(n * replicas)
+        colors_rep = colors[:, None, :].expand(n, replicas, colors.shape[-1]).reshape(n * replicas, colors.shape[-1])
+        return means_rep, quats_rep, scales_rep, opacities_rep, colors_rep
 
     @staticmethod
     def _build_k_mats(intrinsics: torch.Tensor) -> torch.Tensor:

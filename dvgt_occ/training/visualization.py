@@ -399,9 +399,10 @@ def save_training_visualization(
     axes[0, 0].axis("off")
 
     axes[0, 1].imshow(source_panel["pred"])
+    source_mode = "Own-View" if getattr(config, "source_render_own_view_only", False) else "All-Source"
     source_pred_title = "Source Pred Composite" if source_panel["pred_is_composited"] else "Source Pred Gaussian"
     axes[0, 1].set_title(
-        f"{source_pred_title} mean={source_panel['pred_mean']:.3f} max={source_panel['pred_max']:.3f}"
+        f"{source_pred_title} ({source_mode}) mean={source_panel['pred_mean']:.3f} max={source_panel['pred_max']:.3f}"
     )
     axes[0, 1].axis("off")
 

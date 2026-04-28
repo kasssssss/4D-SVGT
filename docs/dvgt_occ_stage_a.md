@@ -1,13 +1,16 @@
 # DVGT-Occ Stage A Scaffold
 
-This scaffold starts the data/cache base described in `目标.md`.
+This scaffold starts the data and supervision base described in `目标.md`.
+DVGT feature/point cache is no longer the main training interface; it is kept
+only for debug, speed sanity, and controlled offline ablations.
 
 ## Current Scope
 
 - `dvgt_occ.data.manifest` maps `nuscenes_processed_10Hz` scenes into fixed
   2Hz clips with `T=8`, `V=6`, and stable view order.
 - `dvgt_occ.data.dataset` can load manifest entries and optional generated
-  `.npy` cache/supervision artifacts.
+  `.npy` debug cache/supervision artifacts. Main training should run the frozen
+  DVGT frontend online so training and inference consume the same RGB interface.
 - `dvgt_occ.models` contains importable module shells for token reassembly,
   STH-style dense decoders, Dynamic/Occ/GS heads, streaming query memory, and
   GS-Occ bridges.
@@ -31,7 +34,7 @@ python tools/dvgt_occ/validate_manifest.py data/nuscenes_dvgt_v0/manifest_trainv
   --root data/nuscenes_dvgt_v0
 ```
 
-Use `--strict-outputs` after DVGT cache, scene-level SAM3 assets, clip-level
+Use `--strict-outputs` after optional DVGT debug cache, scene-level SAM3 assets, clip-level
 SAM3 supervision, track targets, and Occ GT have been generated. The manifest
 stores source paths relative to the Stage-A output root, so
 `--root data/nuscenes_dvgt_v0` is the expected form.
@@ -41,6 +44,8 @@ stores source paths relative to the Stage-A output root, so
 Run the first clip end-to-end before launching all clips:
 
 ```bash
+# Optional debug/offline-ablation cache only; do not use this as the default
+# training data interface.
 python tools/dvgt_occ/cache_dvgt.py data/nuscenes_dvgt_v0/manifest_trainval.json \
   --output-root data/nuscenes_dvgt_v0 \
   --checkpoint pretrained/dvgt2.pt \

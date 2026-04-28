@@ -9,9 +9,14 @@ from dvgt_occ.types import DynamicDenseOutput, ReassembledFeatures
 
 
 class DynamicDenseBranch(nn.Module):
-    def __init__(self, channels: int = 256, full_channels: int = 128) -> None:
+    def __init__(
+        self,
+        channels: int = 256,
+        full_channels: int = 128,
+        output_size: tuple[int, int] = (224, 448),
+    ) -> None:
         super().__init__()
-        self.decoder = DynamicDenseDecoder(channels=channels, full_channels=full_channels)
+        self.decoder = DynamicDenseDecoder(channels=channels, full_channels=full_channels, output_size=output_size)
         self.gradient_checkpointing = False
         self.pre = nn.Sequential(
             nn.Conv2d(channels + 4, full_channels, 3, padding=1),

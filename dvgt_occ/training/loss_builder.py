@@ -136,7 +136,7 @@ class DVGTOccLossBuilder(nn.Module):
             losses["gs_render"] = self._loss_gs_render(outputs, batch)
         if self.weights.sky_alpha > 0.0 and outputs.get("render") is not None:
             losses["sky_alpha"] = self._loss_sky_alpha(outputs, batch)
-        if self.weights.inst_contrast > 0.0 and outputs.get("entities") is not None:
+        if self.weights.inst_contrast > 0.0 and (outputs.get("entities") is not None or outputs.get("gaussians") is not None):
             losses["inst_contrast"] = self._loss_instance_contrast(outputs, batch)
         if any(weight > 0.0 for weight in (self.weights.query2gs, self.weights.q2gs_null)) and outputs.get("assignment") is not None:
             losses["query2gs"], losses["q2gs_null"] = self._loss_query_to_gaussian(outputs, batch)
@@ -280,7 +280,8 @@ class DVGTOccLossBuilder(nn.Module):
             return _zero_like(outputs["dynamic"].dyn_logit_1_4)
 
         pred = outputs["render"].render_rgb_all
-        if outputs["render"].render_rgb_all_composited is not None:
+        use_composite = bool(getattr(self.config, "render_loss_use_composite", True))
+        if use_composite and outputs["render"].render_rgb_all_composited is not None:
             pred = outputs["render"].render_rgb_all_composited
         target = batch["rgb_target"]
 
@@ -292,6 +293,10 @@ class DVGTOccLossBuilder(nn.Module):
             source_mask = target_is_source[:, None, :, None, None, None].to(dtype=valid.dtype, device=valid.device)
             view_weight = source_mask * source_weight + (1.0 - source_mask) * heldout_weight
             valid = valid * view_weight
+        if bool(getattr(self.config, "render_loss_mask_sky", False)) and "sky_mask_full" in batch:
+            sky = batch["sky_mask_full"].to(device=valid.device, dtype=valid.dtype)
+            if sky.ndim == 5 and sky.shape[:3] == valid.shape[:3]:
+                valid = valid * (1.0 - sky[:, :, :, None].clamp(0.0, 1.0))
 
         valid_sum = valid.sum().clamp_min(1.0)
         l1 = ((pred - target).abs() * valid).sum() / valid_sum
@@ -304,10 +309,18 @@ class DVGTOccLossBuilder(nn.Module):
         lpips_weight = lpips_base_weight * min(float(self._current_step_hint(outputs, batch)) / 1000.0, 1.0)
         gs_conf_loss = _zero_like(l1)
         scale_reg = _zero_like(l1)
+        scale_floor = _zero_like(l1)
         color_sup = _zero_like(l1)
         gaussians = outputs.get("gaussians")
         if gaussians is not None:
-            scale_reg = torch.mean(torch.relu(gaussians.scale - 0.30))
+            scale_reg_max = float(getattr(self.config, "gs_scale_reg_max", 0.30))
+            scale_reg_weight = float(getattr(self.config, "gs_scale_reg_weight", 0.10))
+            scale_floor_target = float(getattr(self.config, "gs_scale_floor_target", 0.0))
+            scale_floor_weight = float(getattr(self.config, "gs_scale_floor_weight", 0.0))
+            if scale_reg_weight > 0.0 and scale_reg_max > 0.0:
+                scale_reg = torch.mean(torch.relu(gaussians.scale - scale_reg_max))
+            if scale_floor_target > 0.0 and scale_floor_weight > 0.0:
+                scale_floor = torch.mean(torch.relu(scale_floor_target - gaussians.scale))
             feat_dc = gaussians.feat_dc
             b_g, t_g, v_g, h_g, w_g, _ = feat_dc.shape
             gt_rgb = batch.get("source_rgb", batch.get("rgb_source", batch["rgb_target"]))
@@ -317,7 +330,14 @@ class DVGTOccLossBuilder(nn.Module):
                     size=(h_g, w_g), mode="bilinear", align_corners=False,
                 ).reshape(b_g, t_g, v_g, 3, h_g, w_g).permute(0, 1, 2, 4, 5, 3)
                 color_sup = (feat_dc - gt_down).abs().mean()
-        return l1 + lpips_weight * lpips_loss + 0.01 * gs_conf_loss + 0.1 * scale_reg + 1.0 * color_sup
+        return (
+            l1
+            + lpips_weight * lpips_loss
+            + 0.01 * gs_conf_loss
+            + scale_reg_weight * scale_reg
+            + scale_floor_weight * scale_floor
+            + 1.0 * color_sup
+        )
 
     def _loss_sky_alpha(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         sky_mask = batch.get("sky_mask_full")
@@ -371,8 +391,35 @@ class DVGTOccLossBuilder(nn.Module):
         return loss_presence, loss_match, loss_cls, loss_box
 
     def _loss_instance_contrast(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        embeddings = outputs["entities"].refined_instance_affinity
+        if outputs.get("entities") is not None:
+            embeddings = outputs["entities"].refined_instance_affinity
+        elif outputs.get("gaussians") is not None:
+            embeddings = outputs["gaussians"].instance_affinity
+        else:
+            return _zero_like(outputs["dynamic"].dyn_logit_1_4)
         global_ids = batch["gs_global_track_id_1_8"]
+        target_is_source = batch.get("target_is_source")
+        if target_is_source is not None and global_ids.shape[2] != embeddings.shape[2]:
+            source_ids = global_ids.new_full(
+                (global_ids.shape[0], global_ids.shape[1], embeddings.shape[2], global_ids.shape[3], global_ids.shape[4]),
+                -1,
+            )
+            for batch_idx in range(global_ids.shape[0]):
+                src_indices = torch.nonzero(target_is_source[batch_idx], as_tuple=False).flatten()[: embeddings.shape[2]]
+                if src_indices.numel() == 0:
+                    continue
+                take = int(src_indices.numel())
+                source_ids[batch_idx, :, :take] = global_ids[batch_idx, :, src_indices]
+            global_ids = source_ids
+        elif global_ids.shape[2] != embeddings.shape[2]:
+            global_ids = global_ids[:, :, : embeddings.shape[2]]
+        if global_ids.shape[-2:] != embeddings.shape[-3:-1]:
+            b, t, v, h, w = global_ids.shape
+            global_ids = F.interpolate(
+                global_ids.float().reshape(b * t * v, 1, h, w),
+                size=embeddings.shape[-3:-1],
+                mode="nearest",
+            ).reshape(b, t, v, embeddings.shape[-3], embeddings.shape[-2]).long()
         reference = embeddings
         losses = []
         for batch_idx in range(embeddings.shape[0]):
@@ -529,7 +576,11 @@ class DVGTOccLossBuilder(nn.Module):
         return F.smooth_l1_loss(outputs["entities"].refined_motion_code, gauss_motion)
 
     def _loss_gs_sparse(self, outputs: Dict[str, object], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        opacity = outputs["gaussians"].opacity
+        gaussians = outputs["gaussians"]
+        opacity = gaussians.opacity
+        keep_score = getattr(gaussians, "keep_score", None)
+        if keep_score is not None and float(getattr(self.config, "render_keep_score_gate", 0.0)) > 0.0:
+            return (opacity * keep_score).mean()
         return opacity.mean()
 
     def _build_render_valid_mask(self, points_conf: torch.Tensor, threshold: float = 0.30, dilate_px: int = 5) -> torch.Tensor:

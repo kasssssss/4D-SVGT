@@ -203,6 +203,13 @@ def build_runtime_config(args: argparse.Namespace, cfg: Dict[str, object]) -> Di
         "supervision_ready_files": ready_files,
         "bridge_start_step": int(train_cfg.get("bridge_start_step", train_cfg.get("stability_start_step", 0))),
         "stability_start_step": int(train_cfg.get("stability_start_step", 0)),
+        "reset_module_prefixes": (
+            tuple(str(item) for item in train_cfg.get("reset_module_prefixes", []))
+            if os.environ.get("RESET_MODULES", "0") == "1"
+            else ()
+        ),
+        "reset_step_on_resume": bool(train_cfg.get("reset_step_on_resume", False))
+        and os.environ.get("RESET_STEP", "0") == "1",
         "allow_tf32": bool(train_cfg.get("allow_tf32", True)),
         "log_dir": Path(args.log_dir or train_cfg.get("log_dir", "data/nuscenes_dvgt_v0/logs/train_stage")),
         "visualize_every_epochs": int(train_cfg.get("visualize_every_epochs", 100)),
@@ -250,6 +257,25 @@ def build_model_config(cfg: Dict[str, object]) -> DVGTOccConfig:
         "render_source_weight": float(model_cfg.get("render_source_weight", base.render_source_weight)),
         "render_heldout_weight": float(model_cfg.get("render_heldout_weight", base.render_heldout_weight)),
         "render_lpips_weight": float(model_cfg.get("render_lpips_weight", base.render_lpips_weight)),
+        "render_loss_use_composite": bool(model_cfg.get("render_loss_use_composite", base.render_loss_use_composite)),
+        "render_loss_mask_sky": bool(model_cfg.get("render_loss_mask_sky", base.render_loss_mask_sky)),
+        "render_enable_sky_background": bool(model_cfg.get("render_enable_sky_background", base.render_enable_sky_background)),
+        "render_scale_max": float(model_cfg.get("render_scale_max", base.render_scale_max)),
+        "render_rasterize_mode": str(model_cfg.get("render_rasterize_mode", base.render_rasterize_mode)),
+        "render_keep_score_gate": float(model_cfg.get("render_keep_score_gate", base.render_keep_score_gate)),
+        "render_keep_topk_ratio": float(model_cfg.get("render_keep_topk_ratio", base.render_keep_topk_ratio)),
+        "render_antigrid_replicas": int(model_cfg.get("render_antigrid_replicas", base.render_antigrid_replicas)),
+        "render_antigrid_jitter_m": float(model_cfg.get("render_antigrid_jitter_m", base.render_antigrid_jitter_m)),
+        "gs_scale_reg_max": float(model_cfg.get("gs_scale_reg_max", base.gs_scale_reg_max)),
+        "gs_scale_reg_weight": float(model_cfg.get("gs_scale_reg_weight", base.gs_scale_reg_weight)),
+        "gs_scale_floor_target": float(model_cfg.get("gs_scale_floor_target", base.gs_scale_floor_target)),
+        "gs_scale_floor_weight": float(model_cfg.get("gs_scale_floor_weight", base.gs_scale_floor_weight)),
+        "gs_init_scale": float(model_cfg.get("gs_init_scale", base.gs_init_scale)),
+        "gs_init_opacity_logit": float(model_cfg.get("gs_init_opacity_logit", base.gs_init_opacity_logit)),
+        "gs_anchor_jitter_m": float(model_cfg.get("gs_anchor_jitter_m", base.gs_anchor_jitter_m)),
+        "gs_output_level": str(model_cfg.get("gs_output_level", base.gs_output_level)),
+        "gs_scale_multiplier": float(model_cfg.get("gs_scale_multiplier", base.gs_scale_multiplier)),
+        "source_render_own_view_only": bool(model_cfg.get("source_render_own_view_only", base.source_render_own_view_only)),
         "selected_layers": tuple(model_cfg.get("selected_layers", list(base.selected_layers))),
         "camera_view_ids": tuple(model_cfg.get("camera_view_ids", list(base.camera_view_ids))),
         "occ_grid": base.occ_grid,
@@ -297,7 +323,9 @@ def configure_trainable_modules(model: torch.nn.Module, train_target: str, train
     if train_target == "occ_only":
         enabled_prefixes = ("reassembly.", "dynamic_dense.", "occ_head.")
     elif train_target == "gs_only":
-        if train_mode == "v1-gs-aux":
+        if train_mode == "v1-gs-finetune":
+            enabled_prefixes = ("gs_reassembly.", "gs_head.")
+        elif train_mode == "v1-gs-aux":
             enabled_prefixes = ("reassembly.", "gs_reassembly.", "dynamic_dense.", "gs_head.")
         elif train_mode == "v1-sky-ablation":
             enabled_prefixes = ("gs_reassembly.", "gs_head.", "sky_model.")
@@ -316,6 +344,26 @@ def configure_trainable_modules(model: torch.nn.Module, train_target: str, train
 
     if hasattr(model, "set_train_target"):
         model.set_train_target(train_target)
+
+
+def reset_modules_by_prefix(model: torch.nn.Module, prefixes: Sequence[str]) -> list[str]:
+    reset: list[str] = []
+    if not prefixes:
+        return reset
+    for module_name, module in model.named_modules():
+        if not module_name:
+            continue
+        if not any(module_name == prefix.rstrip(".") or module_name.startswith(prefix) for prefix in prefixes):
+            continue
+        if hasattr(module, "reset_parameters"):
+            module.reset_parameters()
+            reset.append(module_name)
+    gs_head = getattr(model, "gs_head", None)
+    if gs_head is not None and any(prefix in ("gs_head", "gs_head.") for prefix in prefixes):
+        if hasattr(gs_head, "_init_gaussian_head"):
+            gs_head._init_gaussian_head()
+            reset.append("gs_head._init_gaussian_head")
+    return reset
 
 
 def adjust_learning_rate(optimizer: torch.optim.Optimizer, step: int, max_steps: int, warmup_iters: int, min_lr: float) -> None:
@@ -476,6 +524,7 @@ def _ray_reanchor_points_from_source_depth(
     *,
     min_depth: float = 0.5,
     max_depth: float = 120.0,
+    fallback_depth: float = 20.0,
 ) -> torch.Tensor:
     """Keep DVGT depth, but force each source anchor onto its own camera ray."""
     b, t, v, h, w, _ = points_world.shape
@@ -484,7 +533,10 @@ def _ray_reanchor_points_from_source_depth(
     points_h = torch.cat([points_world, torch.ones((*points_world.shape[:-1], 1), device=device, dtype=dtype)], dim=-1)
     world_to_camera = torch.linalg.inv(source_camera_to_world.float()).to(dtype)
     cam = torch.einsum("btvij,btvhwj->btvhwi", world_to_camera, points_h)[..., :3]
-    depth = cam[..., 2].clamp(min=float(min_depth), max=float(max_depth))
+    raw_depth = cam[..., 2]
+    valid_depth = torch.isfinite(raw_depth) & (raw_depth > float(min_depth)) & (raw_depth < float(max_depth))
+    fallback = torch.full_like(raw_depth, float(fallback_depth))
+    depth = torch.where(valid_depth, raw_depth, fallback).clamp(min=float(min_depth), max=float(max_depth))
 
     ys = torch.arange(h, device=device, dtype=dtype)
     xs = torch.arange(w, device=device, dtype=dtype)
@@ -799,8 +851,11 @@ def collect_debug_metrics_with_batch(outputs: Dict[str, object], batch: Dict[str
         metrics["debug_render_alpha_mean"] = render.render_alpha_all.mean()
         metrics["debug_render_dyn_alpha_coverage"] = (render.render_alpha_dynamic > 1e-3).float().mean()
         metrics["debug_render_dyn_alpha_mean"] = render.render_alpha_dynamic.mean()
-        metrics["debug_render_static_alpha_coverage"] = (render.render_alpha_static > 1e-3).float().mean()
-        metrics["debug_render_static_alpha_mean"] = render.render_alpha_static.mean()
+        render_static_alpha = render.render_alpha_static
+        if render_static_alpha.numel() > 0 and float(render_static_alpha.detach().abs().max().item()) <= 1e-8:
+            render_static_alpha = (render.render_alpha_all - render.render_alpha_dynamic).clamp_min(0.0)
+        metrics["debug_render_static_alpha_coverage"] = (render_static_alpha > 1e-3).float().mean()
+        metrics["debug_render_static_alpha_mean"] = render_static_alpha.mean()
         metrics["debug_render_rgb_mean"] = render.render_rgb_all.mean()
         metrics["debug_render_rgb_max"] = render.render_rgb_all.max()
         if render.debug_mean_sigma is not None:
@@ -991,26 +1046,53 @@ def main() -> None:
             try:
                 raw_model.load_state_dict(checkpoint["model"], strict=True)
             except RuntimeError as exc:
-                if "gs_head.dynamic_head." not in str(exc):
+                allow_dynamic_head = "gs_head.dynamic_head." in str(exc)
+                allow_full_pre = "gs_head.pre_full." in str(exc)
+                if not (allow_dynamic_head or allow_full_pre):
                     raise
                 load_result = raw_model.load_state_dict(checkpoint["model"], strict=False)
                 missing = list(load_result.missing_keys)
                 unexpected = list(load_result.unexpected_keys)
-                allowed_missing = [key for key in missing if key.startswith("gs_head.dynamic_head.")]
+                allowed_missing = [
+                    key
+                    for key in missing
+                    if key.startswith("gs_head.dynamic_head.") or key.startswith("gs_head.pre_full.")
+                ]
                 if len(allowed_missing) != len(missing) or unexpected:
                     raise RuntimeError(
-                        "Checkpoint can only be resumed forgivingly when the new per-Gaussian dynamic head is missing."
+                        "Checkpoint can only be resumed forgivingly when known new GS modules are missing."
                     ) from exc
+                if any(key.startswith("gs_head.pre_full.") for key in missing):
+                    raw_model.gs_head.initialize_full_pre_from_lowres()
                 optimizer_resume_ok = False
                 if rank == 0:
                     print(
-                        "[resume] initialized new gs_head.dynamic_head from defaults; "
+                        f"[resume] initialized new GS modules from defaults/mapped weights: {missing}; "
                         "skipping optimizer state from the older checkpoint.",
                         flush=True,
                     )
             if optimizer_resume_ok and os.environ.get("RESET_OPTIMIZER", "0") != "1":
                 optimizer.load_state_dict(checkpoint["optimizer"])
             start_step = int(checkpoint.get("step", -1)) + 1
+            if runtime["reset_step_on_resume"]:
+                if rank == 0:
+                    print(
+                        f"[resume] reset training step from checkpoint step {checkpoint.get('step', -1)} to 0",
+                        flush=True,
+                    )
+                start_step = 0
+
+        if runtime["reset_module_prefixes"]:
+            reset_names = reset_modules_by_prefix(raw_model, runtime["reset_module_prefixes"])
+            if any(str(prefix).startswith(("gs_head.head", "gs_head.dynamic_head")) for prefix in runtime["reset_module_prefixes"]):
+                raw_model.gs_head._init_gaussian_head()
+            if rank == 0:
+                print(
+                    "[reset_modules] prefixes="
+                    f"{list(runtime['reset_module_prefixes'])} reset={reset_names[:50]}"
+                    f"{'...' if len(reset_names) > 50 else ''}",
+                    flush=True,
+                )
 
         log_dir = runtime["log_dir"]
         if rank == 0:
